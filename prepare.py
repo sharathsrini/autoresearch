@@ -1,389 +1,486 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation for time series anomaly detection autoresearch.
+Generates synthetic multivariate time series with injected anomalies,
+or loads user-provided CSV data.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                    # generate synthetic data
+    python prepare.py --data-dir ./mydata  # use custom CSV files
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is stored in ~/.cache/autoresearch_ad/.
 """
 
 import os
 import sys
-import time
 import math
 import argparse
-import pickle
-from multiprocessing import Pool
+import json
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import numpy as np
 import torch
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
+WINDOW_SIZE = 100        # sliding window length
+STRIDE = 1               # stride for sliding windows
+N_FEATURES = 25          # number of features in multivariate time series
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+ANOMALY_RATIO = 0.05     # fraction of points that are anomalous
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_ad")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
-# Data download
+# Synthetic data generation
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+def generate_normal_series(length, n_features, seed=42):
+    """Generate normal multivariate time series with realistic patterns."""
+    rng = np.random.RandomState(seed)
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+    t = np.arange(length, dtype=np.float64)
+    data = np.zeros((length, n_features), dtype=np.float64)
 
+    for f in range(n_features):
+        # Base: mix of sinusoidal components with different frequencies
+        freq1 = rng.uniform(0.001, 0.01)
+        freq2 = rng.uniform(0.01, 0.05)
+        freq3 = rng.uniform(0.05, 0.15)
+        amp1 = rng.uniform(0.5, 2.0)
+        amp2 = rng.uniform(0.2, 1.0)
+        amp3 = rng.uniform(0.1, 0.5)
+        phase1 = rng.uniform(0, 2 * np.pi)
+        phase2 = rng.uniform(0, 2 * np.pi)
+        phase3 = rng.uniform(0, 2 * np.pi)
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+        signal = (amp1 * np.sin(2 * np.pi * freq1 * t + phase1) +
+                  amp2 * np.sin(2 * np.pi * freq2 * t + phase2) +
+                  amp3 * np.sin(2 * np.pi * freq3 * t + phase3))
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+        # Add slow trend
+        trend_slope = rng.uniform(-0.0005, 0.0005)
+        signal += trend_slope * t
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+        # Add Gaussian noise
+        noise_std = rng.uniform(0.05, 0.3)
+        signal += rng.normal(0, noise_std, length)
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+        # Inter-feature correlations: some features are correlated
+        if f > 0 and rng.random() < 0.4:
+            src = rng.randint(0, f)
+            corr_weight = rng.uniform(0.2, 0.6)
+            signal += corr_weight * data[:, src]
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+        data[:, f] = signal
 
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    return data
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def inject_anomalies(data, anomaly_ratio, seed=123):
+    """Inject various types of anomalies into time series data.
 
+    Returns:
+        data_with_anomalies: modified data
+        labels: binary array (1 = anomaly)
+    """
+    rng = np.random.RandomState(seed)
+    length, n_features = data.shape
+    labels = np.zeros(length, dtype=np.int32)
+    data_anom = data.copy()
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    n_anomalous_points = int(length * anomaly_ratio)
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    # We inject anomalies as contiguous segments of various types
+    anomaly_types = ['spike', 'level_shift', 'variance_change', 'trend_change', 'contextual']
+    points_placed = 0
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    while points_placed < n_anomalous_points:
+        atype = rng.choice(anomaly_types)
+        seg_len = rng.randint(10, min(80, n_anomalous_points - points_placed + 1))
+        if seg_len <= 0:
+            break
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+        # Find a non-anomalous region to place the anomaly
+        max_tries = 100
+        for _ in range(max_tries):
+            start = rng.randint(WINDOW_SIZE, length - seg_len)
+            if labels[start:start + seg_len].sum() == 0:
+                break
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            break
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+        # Pick subset of features to affect
+        n_affected = rng.randint(1, max(2, n_features // 3))
+        affected_features = rng.choice(n_features, n_affected, replace=False)
+
+        if atype == 'spike':
+            for f in affected_features:
+                std = np.std(data[:, f])
+                spikes = rng.choice(seg_len, min(seg_len // 2, 5), replace=False)
+                for s in spikes:
+                    data_anom[start + s, f] += rng.choice([-1, 1]) * rng.uniform(4, 8) * std
+
+        elif atype == 'level_shift':
+            for f in affected_features:
+                std = np.std(data[:, f])
+                shift = rng.choice([-1, 1]) * rng.uniform(3, 6) * std
+                data_anom[start:start + seg_len, f] += shift
+
+        elif atype == 'variance_change':
+            for f in affected_features:
+                std = np.std(data[:, f])
+                noise = rng.normal(0, std * rng.uniform(3, 6), seg_len)
+                data_anom[start:start + seg_len, f] += noise
+
+        elif atype == 'trend_change':
+            for f in affected_features:
+                std = np.std(data[:, f])
+                slope = rng.choice([-1, 1]) * rng.uniform(0.05, 0.2) * std
+                trend = slope * np.arange(seg_len)
+                data_anom[start:start + seg_len, f] += trend
+
+        elif atype == 'contextual':
+            for f in affected_features:
+                std = np.std(data[:, f])
+                data_anom[start:start + seg_len, f] += rng.normal(0, std * 2, seg_len)
+
+        labels[start:start + seg_len] = 1
+        points_placed += seg_len
+
+    return data_anom, labels
+
+
+def generate_dataset(train_length=50000, test_length=20000, n_features=N_FEATURES):
+    """Generate full train/test dataset with anomalies only in test."""
+    # Training data: normal only (for reconstruction-based methods)
+    train_data = generate_normal_series(train_length, n_features, seed=42)
+    train_labels = np.zeros(train_length, dtype=np.int32)
+
+    # Test data: normal base + injected anomalies
+    test_data_clean = generate_normal_series(test_length, n_features, seed=99)
+    test_data, test_labels = inject_anomalies(test_data_clean, ANOMALY_RATIO, seed=123)
+
+    # Validation data: separate normal + anomalies for metric evaluation
+    val_data_clean = generate_normal_series(test_length, n_features, seed=77)
+    val_data, val_labels = inject_anomalies(val_data_clean, ANOMALY_RATIO, seed=456)
+
+    return {
+        'train_data': train_data,
+        'train_labels': train_labels,
+        'test_data': test_data,
+        'test_labels': test_labels,
+        'val_data': val_data,
+        'val_labels': val_labels,
+    }
+
+
+def save_dataset(dataset, data_dir=DATA_DIR):
+    """Save dataset as .npy files."""
+    os.makedirs(data_dir, exist_ok=True)
+    for key, arr in dataset.items():
+        np.save(os.path.join(data_dir, f"{key}.npy"), arr)
+
+    # Save metadata
+    meta = {
+        'n_features': dataset['train_data'].shape[1],
+        'train_length': len(dataset['train_data']),
+        'test_length': len(dataset['test_data']),
+        'val_length': len(dataset['val_data']),
+        'anomaly_ratio_test': float(dataset['test_labels'].mean()),
+        'anomaly_ratio_val': float(dataset['val_labels'].mean()),
+        'window_size': WINDOW_SIZE,
+    }
+    with open(os.path.join(data_dir, "metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Dataset saved to {data_dir}")
+    print(f"  Train: {meta['train_length']} points, {meta['n_features']} features")
+    print(f"  Test:  {meta['test_length']} points, anomaly ratio: {meta['anomaly_ratio_test']:.3f}")
+    print(f"  Val:   {meta['val_length']} points, anomaly ratio: {meta['anomaly_ratio_val']:.3f}")
+
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+def load_data(split, data_dir=DATA_DIR):
+    """Load data and labels for a split ('train', 'test', 'val')."""
+    data = np.load(os.path.join(data_dir, f"{split}_data.npy"))
+    labels = np.load(os.path.join(data_dir, f"{split}_labels.npy"))
+    return data, labels
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def get_metadata(data_dir=DATA_DIR):
+    """Load dataset metadata."""
+    with open(os.path.join(data_dir, "metadata.json"), "r") as f:
+        return json.load(f)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+def normalize_data(train_data, *other_data):
+    """Z-score normalization fitted on training data.
+
+    Returns:
+        normalized_train, *normalized_others, mean, std
+    """
+    mean = train_data.mean(axis=0)
+    std = train_data.std(axis=0)
+    std[std < 1e-8] = 1.0  # avoid division by zero
+
+    result = [(train_data - mean) / std]
+    for d in other_data:
+        result.append((d - mean) / std)
+    result.extend([mean, std])
+    return tuple(result)
+
+
+def create_windows(data, labels, window_size=WINDOW_SIZE, stride=STRIDE):
+    """Create sliding windows from time series data.
+
+    Args:
+        data: (length, n_features) array
+        labels: (length,) array of binary labels
+
+    Returns:
+        windows: (n_windows, window_size, n_features) array
+        window_labels: (n_windows,) array — 1 if ANY point in window is anomalous
+        point_labels: (n_windows, window_size) array — per-point labels within each window
+    """
+    length = len(data)
+    n_windows = (length - window_size) // stride + 1
+
+    windows = np.zeros((n_windows, window_size, data.shape[1]), dtype=np.float32)
+    window_labels = np.zeros(n_windows, dtype=np.int32)
+    point_labels = np.zeros((n_windows, window_size), dtype=np.int32)
+
+    for i in range(n_windows):
+        start = i * stride
+        end = start + window_size
+        windows[i] = data[start:end]
+        point_labels[i] = labels[start:end]
+        window_labels[i] = 1 if labels[start:end].any() else 0
+
+    return windows, window_labels, point_labels
+
+
+def make_dataloader(split, batch_size, window_size=WINDOW_SIZE, stride=STRIDE,
+                    shuffle=True, device="cuda"):
+    """Create an infinite dataloader yielding (windows, window_labels) batches.
+
+    For training split: only yields normal windows (label=0).
+    For val/test split: yields all windows.
+    """
+    data, labels = load_data(split)
+
+    # Normalize using training statistics
+    train_data, _ = load_data("train")
+    mean = train_data.mean(axis=0)
+    std = train_data.std(axis=0)
+    std[std < 1e-8] = 1.0
+    data_norm = (data - mean) / std
+
+    windows, window_labels, point_labels = create_windows(data_norm, labels, window_size, stride)
+
     if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
+        # Only normal windows for training reconstruction
+        normal_mask = window_labels == 0
+        windows = windows[normal_mask]
+        window_labels = window_labels[normal_mask]
+        point_labels = point_labels[normal_mask]
+
+    windows_t = torch.from_numpy(windows).float()
+    labels_t = torch.from_numpy(window_labels).long()
+
+    n = len(windows_t)
+    indices = np.arange(n)
+
+    epoch = 0
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        if shuffle:
+            np.random.shuffle(indices)
         epoch += 1
+        for start in range(0, n - batch_size + 1, batch_size):
+            idx = indices[start:start + batch_size]
+            batch_w = windows_t[idx].to(device, non_blocking=True)
+            batch_l = labels_t[idx].to(device, non_blocking=True)
+            yield batch_w, batch_l, epoch
 
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Evaluation (DO NOT CHANGE -- this is the fixed metric)
 # ---------------------------------------------------------------------------
+
+def _point_adjust_labels(pred, true):
+    """Point-adjust: if any point in a contiguous anomaly segment is detected,
+    mark the entire segment as detected. This is standard in the literature
+    (Xu et al., 2018; Su et al., 2019)."""
+    adjusted_pred = pred.copy()
+    anomaly_segments = []
+    in_segment = False
+    start = 0
+
+    for i in range(len(true)):
+        if true[i] == 1 and not in_segment:
+            in_segment = True
+            start = i
+        elif true[i] == 0 and in_segment:
+            in_segment = False
+            anomaly_segments.append((start, i))
+    if in_segment:
+        anomaly_segments.append((start, len(true)))
+
+    for seg_start, seg_end in anomaly_segments:
+        if adjusted_pred[seg_start:seg_end].any():
+            adjusted_pred[seg_start:seg_end] = 1
+
+    return adjusted_pred
+
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_f1(model, device="cuda", split="val"):
+    """Evaluate anomaly detection using best F1 score (point-adjusted).
+
+    The model must implement:
+        anomaly_scores = model.compute_anomaly_scores(windows)
+    where windows is (batch, window_size, n_features) and anomaly_scores is (batch,).
+
+    Higher anomaly_score = more anomalous.
+    We search over thresholds to find the best F1.
+
+    Returns:
+        best_f1: float (higher is better, this is the primary metric)
+        best_threshold: float
+        precision: float at best threshold
+        recall: float at best threshold
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    data, labels = load_data(split)
+    train_data, _ = load_data("train")
+    mean = train_data.mean(axis=0)
+    std = train_data.std(axis=0)
+    std[std < 1e-8] = 1.0
+    data_norm = (data - mean) / std
+
+    windows, window_labels, point_labels = create_windows(
+        data_norm, labels, WINDOW_SIZE, stride=1
+    )
+
+    windows_t = torch.from_numpy(windows).float().to(device)
+
+    # Compute anomaly scores in batches
+    batch_size = 256
+    all_scores = []
+    for i in range(0, len(windows_t), batch_size):
+        batch = windows_t[i:i + batch_size]
+        scores = model.compute_anomaly_scores(batch)
+        all_scores.append(scores.cpu())
+    all_scores = torch.cat(all_scores).numpy()
+
+    # Map window-level scores back to point-level scores (max over overlapping windows)
+    n_points = len(labels)
+    point_scores = np.full(n_points, -np.inf)
+    for i in range(len(all_scores)):
+        start = i
+        end = start + WINDOW_SIZE
+        point_scores[start:end] = np.maximum(point_scores[start:end], all_scores[i])
+
+    # Replace -inf with min score for points not covered by any window
+    valid_mask = point_scores > -np.inf
+    if valid_mask.any():
+        min_score = point_scores[valid_mask].min()
+        point_scores[~valid_mask] = min_score
+
+    # Search thresholds for best F1 (point-adjusted)
+    # Use percentiles of the score distribution as candidate thresholds
+    percentiles = np.arange(90, 100, 0.5)
+    thresholds = np.percentile(point_scores, percentiles)
+    # Also add some evenly spaced thresholds
+    extra = np.linspace(np.percentile(point_scores, 85), point_scores.max(), 50)
+    thresholds = np.unique(np.concatenate([thresholds, extra]))
+
+    best_f1 = 0.0
+    best_threshold = thresholds[0]
+    best_prec = 0.0
+    best_rec = 0.0
+
+    for thresh in thresholds:
+        pred = (point_scores >= thresh).astype(np.int32)
+        adj_pred = _point_adjust_labels(pred, labels)
+
+        if adj_pred.sum() == 0:
+            continue
+
+        f1 = f1_score(labels, adj_pred, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = thresh
+            best_prec = precision_score(labels, adj_pred, zero_division=0)
+            best_rec = recall_score(labels, adj_pred, zero_division=0)
+
+    return best_f1, best_threshold, best_prec, best_rec
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare data for anomaly detection autoresearch")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Path to custom CSV data directory. If not provided, generates synthetic data.")
+    parser.add_argument("--train-length", type=int, default=50000,
+                        help="Length of training time series (synthetic mode)")
+    parser.add_argument("--test-length", type=int, default=20000,
+                        help="Length of test/val time series (synthetic mode)")
+    parser.add_argument("--n-features", type=int, default=N_FEATURES,
+                        help="Number of features (synthetic mode)")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    if args.data_dir:
+        # Load custom data
+        print(f"Loading custom data from {args.data_dir}...")
+        import pandas as pd
+        train_df = pd.read_csv(os.path.join(args.data_dir, "train.csv"))
+        test_df = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
+        test_labels_df = pd.read_csv(os.path.join(args.data_dir, "test_labels.csv"))
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+        # Expect: train.csv has feature columns only (all normal)
+        # test.csv has feature columns, test_labels.csv has a single 'label' column
+        train_data = train_df.values.astype(np.float64)
+        test_data = test_df.values.astype(np.float64)
+        test_labels = test_labels_df.values.flatten().astype(np.int32)
+
+        # Use last 40% of test as validation
+        split_idx = int(len(test_data) * 0.6)
+        val_data = test_data[split_idx:]
+        val_labels = test_labels[split_idx:]
+        test_data = test_data[:split_idx]
+        test_labels = test_labels[:split_idx]
+
+        dataset = {
+            'train_data': train_data,
+            'train_labels': np.zeros(len(train_data), dtype=np.int32),
+            'test_data': test_data,
+            'test_labels': test_labels,
+            'val_data': val_data,
+            'val_labels': val_labels,
+        }
+    else:
+        # Generate synthetic data
+        print("Generating synthetic multivariate time series data...")
+        dataset = generate_dataset(
+            train_length=args.train_length,
+            test_length=args.test_length,
+            n_features=args.n_features,
+        )
+
+    save_dataset(dataset)
     print()
     print("Done! Ready to train.")
