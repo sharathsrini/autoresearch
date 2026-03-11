@@ -5,7 +5,11 @@ Usage: uv run train.py
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import sys
+
+# CUDA-specific memory optimization (harmless no-op on non-CUDA platforms)
+if not sys.platform.startswith("darwin"):
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
 import math
@@ -229,9 +233,15 @@ FINAL_LR_FRAC = 0.01          # final LR as fraction of initial
 t_start = time.time()
 torch.manual_seed(42)
 np.random.seed(42)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Device selection: CUDA > MPS (Apple Silicon) > CPU
 if torch.cuda.is_available():
+    device = torch.device("cuda")
     torch.cuda.manual_seed(42)
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 print(f"Model type: {MODEL_TYPE}")
 print(f"Time budget: {TIME_BUDGET}s")

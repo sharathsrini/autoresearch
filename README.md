@@ -30,6 +30,24 @@ uv run prepare.py
 uv run train.py
 ```
 
+## Platform support
+
+**Linux + NVIDIA GPU (recommended for DL models):**
+```bash
+# For faster torch install, uncomment the CUDA source in pyproject.toml, then:
+uv sync
+```
+
+**macOS / Apple Silicon:**
+```bash
+# Works out of the box — torch installs with MPS (Metal) support from PyPI
+uv sync
+```
+
+- **sklearn models** (Isolation Forest, LOF): work everywhere, no GPU needed
+- **LSTM-AE / DL models**: run on CUDA, MPS (Apple Silicon), or CPU — MPS is auto-detected
+- Unlike the original autoresearch (which required Flash Attention 3 / Hopper GPU), this version has **no CUDA-only dependencies**
+
 ## Using custom data
 
 To use your own time series data instead of synthetic:
