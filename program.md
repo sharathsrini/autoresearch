@@ -97,7 +97,17 @@ d4e5f6g	0.000000	0.0	crash	Transformer encoder (OOM)
 
 Here are promising research directions for the agent (non-exhaustive):
 
-**Architecture changes:**
+**Statistical / ML models** (set `MODEL_TYPE` accordingly):
+- Isolation Forest: tune n_estimators, max_samples, max_features, contamination
+- Local Outlier Factor (LOF): tune n_neighbors, metric, contamination
+- One-Class SVM (implement using sklearn.svm.OneClassSVM)
+- Elliptic Envelope (sklearn.covariance.EllipticEnvelope)
+- DBSCAN-based anomaly scoring
+- Feature engineering: add statistical features (mean, std, kurtosis, slope) per window before feeding to sklearn models
+- PCA-based anomaly detection (reconstruction error in reduced space)
+- Ensemble of multiple ML detectors
+
+**Deep Learning architectures** (set `MODEL_TYPE = "lstm_ae"` or define new):
 - Transformer-based autoencoders (attention over time steps)
 - 1D Convolutional autoencoders (temporal convolutions)
 - Variational autoencoders (VAE) with KL divergence
@@ -105,6 +115,11 @@ Here are promising research directions for the agent (non-exhaustive):
 - Temporal convolutional networks (TCN)
 - Hybrid CNN-LSTM architectures
 - Multi-scale architectures (different window resolutions)
+
+**Hybrid approaches** (combine ML + DL):
+- Use Isolation Forest scores as an additional feature for the LSTM-AE
+- Ensemble: average anomaly scores from multiple model types
+- Two-stage: ML model for coarse detection, DL model for refinement
 
 **Loss function innovations:**
 - Contrastive learning losses
