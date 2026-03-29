@@ -1,0 +1,59 @@
+{
+  "input_csv": "/mnt/data/Untitled 15_2026-03-29-0307.csv",
+  "output_dir": "/mnt/data/fera_tenor_if_final/output_final",
+  "base_features": [
+    "F02_LOG_RETURN_MAD_Z",
+    "F03_VOLATILITY_SURPRISE",
+    "F04_PERCENTILE_RANK_Z",
+    "F06_CROSS_TENOR_RESIDUAL_MAD_Z",
+    "F07_BUTTERFLY_CURVATURE_MAD_Z"
+  ],
+  "multi_window_features": [
+    "F02_Z_21D",
+    "F02_Z_63D",
+    "F02_Z_126D",
+    "F02_Z_252D",
+    "F03_VOL_HL5",
+    "F03_VOL_HL10",
+    "F03_VOL_HL20",
+    "F03_VOL_HL60",
+    "F06_Z_21D",
+    "F06_Z_63D",
+    "F06_Z_126D",
+    "F06_Z_252D",
+    "F07_Z_21D",
+    "F07_Z_63D",
+    "F07_Z_126D",
+    "F07_Z_252D"
+  ],
+  "metadata_cols": [
+    "TRADE_DATE",
+    "MARKET",
+    "TENOR",
+    "TENOR_NUM",
+    "PRICE_NATIVE",
+    "LOG_PRICE_NATIVE"
+  ],
+  "use_multi_window": false,
+  "completeness_threshold": 0.6,
+  "impute_window_rows": 63,
+  "split_date": "2024-07-01",
+  "auto_adjust_split": true,
+  "auto_test_fraction": 0.3,
+  "min_train_rows_per_market": 500,
+  "min_test_rows_per_market": 100,
+  "apply_scaling": false,
+  "n_estimators": 300,
+  "max_samples": "auto",
+  "contamination": "auto",
+  "max_features": 1.0,
+  "random_state": 42,
+  "n_jobs": -1,
+  "anomaly_threshold": 0.95,
+  "precision_proxy_cutoff": 3.0,
+  "known_events": {
+    "2022-02-24": "Ukraine invasion",
+    "2022-08-26": "TTF all-time high",
+    "2022-09-26": "Nord Stream sabotage"
+  }
+}

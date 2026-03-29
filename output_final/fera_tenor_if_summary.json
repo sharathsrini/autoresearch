@@ -1,0 +1,156 @@
+{
+  "resolved_split_date": "2024-07-01",
+  "feature_cols_requested": [
+    "F02_LOG_RETURN_MAD_Z",
+    "F03_VOLATILITY_SURPRISE",
+    "F04_PERCENTILE_RANK_Z",
+    "F06_CROSS_TENOR_RESIDUAL_MAD_Z",
+    "F07_BUTTERFLY_CURVATURE_MAD_Z"
+  ],
+  "feature_cols_used_by_market": {
+    "JKM": [
+      "F02_LOG_RETURN_MAD_Z",
+      "F03_VOLATILITY_SURPRISE",
+      "F04_PERCENTILE_RANK_Z",
+      "F06_CROSS_TENOR_RESIDUAL_MAD_Z",
+      "F07_BUTTERFLY_CURVATURE_MAD_Z"
+    ],
+    "THE": [
+      "F02_LOG_RETURN_MAD_Z",
+      "F03_VOLATILITY_SURPRISE",
+      "F04_PERCENTILE_RANK_Z",
+      "F06_CROSS_TENOR_RESIDUAL_MAD_Z",
+      "F07_BUTTERFLY_CURVATURE_MAD_Z"
+    ],
+    "TTF": [
+      "F02_LOG_RETURN_MAD_Z",
+      "F03_VOLATILITY_SURPRISE",
+      "F04_PERCENTILE_RANK_Z",
+      "F06_CROSS_TENOR_RESIDUAL_MAD_Z",
+      "F07_BUTTERFLY_CURVATURE_MAD_Z"
+    ]
+  },
+  "overall": {
+    "rows": 136872,
+    "anomaly_rate": 0.04461102343795663,
+    "precision_proxy": 0.8296757287913528,
+    "anomaly_count": 6106
+  },
+  "train": {
+    "rows": 93069,
+    "anomaly_rate": 0.049984420161385636,
+    "precision_proxy": 0.8843508168529665,
+    "anomaly_count": 4652
+  },
+  "test": {
+    "rows": 43803,
+    "anomaly_rate": 0.033194073465287764,
+    "precision_proxy": 0.6547455295735901,
+    "anomaly_count": 1454
+  },
+  "by_market_test": {
+    "JKM": {
+      "rows": 14577,
+      "anomaly_rate": 0.04170954242985525,
+      "precision_proxy": 0.5888157894736842,
+      "anomaly_count": 608
+    },
+    "THE": {
+      "rows": 14613,
+      "anomaly_rate": 0.028604667077259973,
+      "precision_proxy": 0.6985645933014354,
+      "anomaly_count": 418
+    },
+    "TTF": {
+      "rows": 14613,
+      "anomaly_rate": 0.029288989256141793,
+      "precision_proxy": 0.705607476635514,
+      "anomaly_count": 428
+    }
+  },
+  "by_market_all": {
+    "JKM": {
+      "rows": 45348,
+      "anomaly_rate": 0.0473229249360501,
+      "precision_proxy": 0.7628145386766076,
+      "anomaly_count": 2146
+    },
+    "THE": {
+      "rows": 45780,
+      "anomaly_rate": 0.04316295325469637,
+      "precision_proxy": 0.8663967611336032,
+      "anomaly_count": 1976
+    },
+    "TTF": {
+      "rows": 45744,
+      "anomaly_rate": 0.04337180832458902,
+      "precision_proxy": 0.8654233870967742,
+      "anomaly_count": 1984
+    }
+  },
+  "by_tenor_bucket_test": {
+    "prompt_M1-M4": {
+      "rows": 4880,
+      "anomaly_rate": 0.0389344262295082,
+      "precision_proxy": 0.7368421052631579,
+      "anomaly_count": 190
+    },
+    "mid_M5-M12": {
+      "rows": 9760,
+      "anomaly_rate": 0.04016393442622951,
+      "precision_proxy": 0.6530612244897959,
+      "anomaly_count": 392
+    },
+    "far_M13-M36": {
+      "rows": 29163,
+      "anomaly_rate": 0.029900901827658335,
+      "precision_proxy": 0.6376146788990825,
+      "anomaly_count": 872
+    }
+  },
+  "by_tenor_bucket_all": {
+    "prompt_M1-M4": {
+      "rows": 14978,
+      "anomaly_rate": 0.04566697823474429,
+      "precision_proxy": 0.8640350877192983,
+      "anomaly_count": 684
+    },
+    "mid_M5-M12": {
+      "rows": 30616,
+      "anomaly_rate": 0.04517245884504834,
+      "precision_proxy": 0.8250180766449747,
+      "anomaly_count": 1383
+    },
+    "far_M13-M36": {
+      "rows": 91278,
+      "anomaly_rate": 0.044249435789565944,
+      "precision_proxy": 0.8254518445159693,
+      "anomaly_count": 4039
+    }
+  },
+  "market_rate_spread_test": 1.4581376639413273,
+  "tenor_bucket_spread_test": 1.3432348849451046,
+  "known_event_windows_all_data": {
+    "2022-02-24": {
+      "label": "Ukraine invasion",
+      "rows": 540,
+      "anomaly_rate": 0.5018518518518519,
+      "precision_proxy": 0.985239852398524,
+      "anomaly_count": 271
+    },
+    "2022-08-26": {
+      "label": "TTF all-time high",
+      "rows": 504,
+      "anomaly_rate": 0.1349206349206349,
+      "precision_proxy": 0.8529411764705882,
+      "anomaly_count": 68
+    },
+    "2022-09-26": {
+      "label": "Nord Stream sabotage",
+      "rows": 540,
+      "anomaly_rate": 0.07407407407407407,
+      "precision_proxy": 0.775,
+      "anomaly_count": 40
+    }
+  }
+}
