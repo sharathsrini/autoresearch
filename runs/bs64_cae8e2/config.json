@@ -1,0 +1,30 @@
+{
+  "market": "TTF",
+  "bottleneck": 8,
+  "hidden1": 24,
+  "hidden2": 12,
+  "hidden_dims": "24",
+  "activation": "gelu",
+  "epochs": 1000,
+  "batch_size": 64,
+  "lr": 0.002,
+  "weight_decay": 1e-05,
+  "optimizer": "adam",
+  "loss_weight": "uniform",
+  "contractive": 0.08,
+  "seed": 0,
+  "log_every": 20,
+  "time_budget_s": 180,
+  "tag": "bs64_cae8e2",
+  "metrics": {
+    "val_metric": 0.5806900262832642,
+    "train_mse": 0.15034934520863014,
+    "latent_std_min": 0.030691875144839287,
+    "corr_with_F11": -0.22219879604886372
+  },
+  "kept": false,
+  "reasons": [
+    "val_metric 0.580690 not < best 0.561584",
+    "latent_std_min 0.030692 <= 0.05"
+  ]
+}

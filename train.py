@@ -176,7 +176,7 @@ def main():
     p.add_argument("--bottleneck",   type=int,   default=8)
     p.add_argument("--hidden1",      type=int,   default=24)
     p.add_argument("--hidden2",      type=int,   default=12)
-    p.add_argument("--hidden_dims",  type=str,   default="24",
+    p.add_argument("--hidden_dims",  type=str,   default="48",
                    help="comma-separated hidden layer sizes (e.g. '24' or '32,20,12')")
     p.add_argument("--activation",   type=str,   default="gelu",
                    choices=list(_ACT.keys()))
@@ -187,7 +187,7 @@ def main():
     p.add_argument("--optimizer",    type=str,   default="adam", choices=["adam", "adamw"])
     p.add_argument("--loss_weight",  type=str,   default="uniform",
                    choices=["uniform", "inv_vol"])
-    p.add_argument("--contractive",  type=float, default=5e-2,
+    p.add_argument("--contractive",  type=float, default=6e-2,
                    help="encoder-Jacobian penalty coefficient")
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--log_every",    type=int,   default=20)
