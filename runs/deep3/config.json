@@ -1,0 +1,25 @@
+{
+  "market": "TTF",
+  "bottleneck": 4,
+  "hidden1": 24,
+  "hidden2": 12,
+  "hidden_dims": "32,20,12",
+  "epochs": 200,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "seed": 0,
+  "log_every": 20,
+  "time_budget_s": 180,
+  "tag": "deep3",
+  "metrics": {
+    "val_metric": 1.229995608329773,
+    "train_mse": 0.589509887678323,
+    "latent_std_min": 0.26130765676498413,
+    "corr_with_F11": -0.07103321263052116
+  },
+  "kept": false,
+  "reasons": [
+    "val_metric 1.229996 not < best 1.172307"
+  ]
+}

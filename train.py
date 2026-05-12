@@ -23,18 +23,22 @@ import prepare
 # ---------------------------------------------------------------------------
 
 class CurveShapeAE(nn.Module):
-    def __init__(self, n_tenors=36, hidden1=24, hidden2=12, bottleneck=6):
+    def __init__(self, n_tenors=36, hidden_dims=(24, 12), bottleneck=4):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(n_tenors, hidden1), nn.Tanh(),
-            nn.Linear(hidden1, hidden2),  nn.Tanh(),
-            nn.Linear(hidden2, bottleneck),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(bottleneck, hidden2), nn.Tanh(),
-            nn.Linear(hidden2, hidden1),    nn.Tanh(),
-            nn.Linear(hidden1, n_tenors),
-        )
+        dims = [n_tenors, *hidden_dims, bottleneck]
+        enc = []
+        for i in range(len(dims) - 1):
+            enc.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                enc.append(nn.Tanh())
+        self.encoder = nn.Sequential(*enc)
+        rev = list(reversed(dims))
+        dec = []
+        for i in range(len(rev) - 1):
+            dec.append(nn.Linear(rev[i], rev[i + 1]))
+            if i < len(rev) - 2:
+                dec.append(nn.Tanh())
+        self.decoder = nn.Sequential(*dec)
 
     def forward(self, x):
         z = self.encoder(x)
@@ -64,10 +68,13 @@ def train_one_run(args):
 
     train_loader, _val_loader = prepare.make_loaders(train_X, val_X, args.batch_size)
 
+    if args.hidden_dims:
+        hidden_dims = tuple(int(x) for x in args.hidden_dims.split(",") if x.strip())
+    else:
+        hidden_dims = (args.hidden1, args.hidden2)
     model = CurveShapeAE(
         n_tenors=prepare.N_TENORS,
-        hidden1=args.hidden1,
-        hidden2=args.hidden2,
+        hidden_dims=hidden_dims,
         bottleneck=args.bottleneck,
     )
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -133,6 +140,8 @@ def main():
     p.add_argument("--bottleneck",   type=int,   default=4)
     p.add_argument("--hidden1",      type=int,   default=24)
     p.add_argument("--hidden2",      type=int,   default=12)
+    p.add_argument("--hidden_dims",  type=str,   default="24",
+                   help="comma-separated hidden layer sizes (e.g. '24' or '32,20,12')")
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-3)
