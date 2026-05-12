@@ -1,0 +1,24 @@
+{
+  "market": "TTF",
+  "bottleneck": 2,
+  "hidden1": 24,
+  "hidden2": 12,
+  "epochs": 200,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "seed": 0,
+  "log_every": 20,
+  "time_budget_s": 180,
+  "tag": "b2",
+  "metrics": {
+    "val_metric": 2.0357296466827393,
+    "train_mse": 1.5481083851812005,
+    "latent_std_min": 0.2879432439804077,
+    "corr_with_F11": 0.05127122372717636
+  },
+  "kept": false,
+  "reasons": [
+    "val_metric 2.035730 not < best 1.195330"
+  ]
+}

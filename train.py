@@ -130,7 +130,7 @@ def _read_best_val_metric(results_tsv_path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--market",       type=str,   default="TTF")
-    p.add_argument("--bottleneck",   type=int,   default=6)
+    p.add_argument("--bottleneck",   type=int,   default=4)
     p.add_argument("--hidden1",      type=int,   default=24)
     p.add_argument("--hidden2",      type=int,   default=12)
     p.add_argument("--epochs",       type=int,   default=200)
