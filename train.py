@@ -71,8 +71,19 @@ def train_one_run(args):
     if len(train_df) == 0 or len(val_df) == 0:
         raise RuntimeError(f"empty split: train={len(train_df)} val={len(val_df)}")
 
-    train_X, _, _ = prepare.row_standardize(train_df[prepare.TENORS].values)
-    val_X,   _, _ = prepare.row_standardize(val_df[prepare.TENORS].values)
+    train_raw = train_df[prepare.TENORS].values
+    val_raw = val_df[prepare.TENORS].values
+    if args.input_scale == "log_robust_z":
+        train_log = np.log(np.maximum(train_raw, 1e-8))
+        val_log = np.log(np.maximum(val_raw, 1e-8))
+        med = np.nanmedian(train_log, axis=0)
+        mad = np.nanmedian(np.abs(train_log - med), axis=0)
+        scale = np.maximum(mad * 1.4826, 1e-6)
+        train_X = ((train_log - med) / scale).astype(np.float32)
+        val_X = ((val_log - med) / scale).astype(np.float32)
+    else:
+        train_X, _, _ = prepare.row_standardize(train_raw)
+        val_X,   _, _ = prepare.row_standardize(val_raw)
     F11_Z_val = val_df["F11_Z"].values
 
     train_loader, _val_loader = prepare.make_loaders(train_X, val_X, args.batch_size)
@@ -173,20 +184,22 @@ def _read_best_val_metric(results_tsv_path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--market",       type=str,   default="TTF")
-    p.add_argument("--bottleneck",   type=int,   default=12)
+    p.add_argument("--bottleneck",   type=int,   default=16)
     p.add_argument("--hidden1",      type=int,   default=24)
     p.add_argument("--hidden2",      type=int,   default=12)
-    p.add_argument("--hidden_dims",  type=str,   default="96",
+    p.add_argument("--hidden_dims",  type=str,   default="192",
                    help="comma-separated hidden layer sizes (e.g. '24' or '32,20,12')")
     p.add_argument("--activation",   type=str,   default="gelu",
                    choices=list(_ACT.keys()))
-    p.add_argument("--epochs",       type=int,   default=3000)
+    p.add_argument("--epochs",       type=int,   default=15000)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=2e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--optimizer",    type=str,   default="adam", choices=["adam", "adamw"])
+    p.add_argument("--weight_decay", type=float, default=1e-3)
+    p.add_argument("--optimizer",    type=str,   default="adamw", choices=["adam", "adamw"])
     p.add_argument("--loss_weight",  type=str,   default="uniform",
                    choices=["uniform", "inv_vol"])
+    p.add_argument("--input_scale",  type=str,   default="log_robust_z",
+                   choices=["row_std", "log_robust_z"])
     p.add_argument("--contractive",  type=float, default=0.0,
                    help="encoder-Jacobian penalty coefficient")
     p.add_argument("--seed",         type=int,   default=0)
