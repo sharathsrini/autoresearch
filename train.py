@@ -173,21 +173,21 @@ def _read_best_val_metric(results_tsv_path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--market",       type=str,   default="TTF")
-    p.add_argument("--bottleneck",   type=int,   default=4)
+    p.add_argument("--bottleneck",   type=int,   default=8)
     p.add_argument("--hidden1",      type=int,   default=24)
     p.add_argument("--hidden2",      type=int,   default=12)
     p.add_argument("--hidden_dims",  type=str,   default="24",
                    help="comma-separated hidden layer sizes (e.g. '24' or '32,20,12')")
     p.add_argument("--activation",   type=str,   default="gelu",
                    choices=list(_ACT.keys()))
-    p.add_argument("--epochs",       type=int,   default=200)
+    p.add_argument("--epochs",       type=int,   default=1000)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=2e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--optimizer",    type=str,   default="adam", choices=["adam", "adamw"])
     p.add_argument("--loss_weight",  type=str,   default="uniform",
                    choices=["uniform", "inv_vol"])
-    p.add_argument("--contractive",  type=float, default=1e-1,
+    p.add_argument("--contractive",  type=float, default=5e-2,
                    help="encoder-Jacobian penalty coefficient")
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--log_every",    type=int,   default=20)
