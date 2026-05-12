@@ -1,0 +1,26 @@
+{
+  "market": "TTF",
+  "bottleneck": 4,
+  "hidden1": 24,
+  "hidden2": 12,
+  "hidden_dims": "24",
+  "activation": "leaky_relu",
+  "epochs": 200,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "seed": 0,
+  "log_every": 20,
+  "time_budget_s": 180,
+  "tag": "act_lrelu",
+  "metrics": {
+    "val_metric": 1.3232567310333252,
+    "train_mse": 0.8502760223708073,
+    "latent_std_min": 0.25072142481803894,
+    "corr_with_F11": -0.24350918191712229
+  },
+  "kept": false,
+  "reasons": [
+    "val_metric 1.323257 not < best 1.133703"
+  ]
+}

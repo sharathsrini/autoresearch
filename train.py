@@ -22,22 +22,31 @@ import prepare
 # Model
 # ---------------------------------------------------------------------------
 
+_ACT = {
+    "tanh": nn.Tanh,
+    "gelu": nn.GELU,
+    "leaky_relu": lambda: nn.LeakyReLU(0.1),
+    "relu": nn.ReLU,
+}
+
+
 class CurveShapeAE(nn.Module):
-    def __init__(self, n_tenors=36, hidden_dims=(24, 12), bottleneck=4):
+    def __init__(self, n_tenors=36, hidden_dims=(24, 12), bottleneck=4, activation="tanh"):
         super().__init__()
+        act = _ACT[activation]
         dims = [n_tenors, *hidden_dims, bottleneck]
         enc = []
         for i in range(len(dims) - 1):
             enc.append(nn.Linear(dims[i], dims[i + 1]))
             if i < len(dims) - 2:
-                enc.append(nn.Tanh())
+                enc.append(act())
         self.encoder = nn.Sequential(*enc)
         rev = list(reversed(dims))
         dec = []
         for i in range(len(rev) - 1):
             dec.append(nn.Linear(rev[i], rev[i + 1]))
             if i < len(rev) - 2:
-                dec.append(nn.Tanh())
+                dec.append(act())
         self.decoder = nn.Sequential(*dec)
 
     def forward(self, x):
@@ -76,6 +85,7 @@ def train_one_run(args):
         n_tenors=prepare.N_TENORS,
         hidden_dims=hidden_dims,
         bottleneck=args.bottleneck,
+        activation=args.activation,
     )
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -142,6 +152,8 @@ def main():
     p.add_argument("--hidden2",      type=int,   default=12)
     p.add_argument("--hidden_dims",  type=str,   default="24",
                    help="comma-separated hidden layer sizes (e.g. '24' or '32,20,12')")
+    p.add_argument("--activation",   type=str,   default="gelu",
+                   choices=list(_ACT.keys()))
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-3)
