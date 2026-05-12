@@ -1,114 +1,125 @@
-# autoresearch
+# autoresearch — FERA curve-shape autoencoder
 
-This is an experiment to have the LLM do its own research.
+You are an autonomous research agent. Your job is to lower a single number
+(`val_metric`) on a small autoencoder that detects anomalies in energy
+forward curves. Iterate via short experiments, one git branch each.
 
-## Setup
+## Repo orientation
 
-To set up a new experiment, work with the user to:
+Three files matter:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+- **`prepare.py`** — fixed. Reads CSVs, builds the per-market curve dataset,
+  applies the walk-forward split, filters the training window, row-standardizes
+  inputs, exposes `compute_metric` and the kept-guards. **Do not modify.**
+- **`train.py`** — the only file you edit. Contains `CurveShapeAE`, the
+  training loop, optimizer wiring, CLI args.
+- **`program.md`** — these instructions.
 
-Once you get confirmation, kick off the experimentation.
+Everything else (CSV data, `runs/`, `results.tsv`, `pyproject.toml`,
+`requirements.txt`) is fixed scaffolding.
 
-## Experimentation
+Data inputs (read by `prepare.py`, do not touch):
+`ml_wide.csv`, `ml_long.csv`, `curve_features.csv`, `tenor_features.csv`,
+`cross-market-features.csv`. Lookup is `data/<name>` first, then repo root.
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+## The single metric
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
-
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
-
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
-
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
-
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
-
-## Output format
-
-Once the script finishes it prints a summary like this:
+Lower is better:
 
 ```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+val_metric = mean over val rows of  sum_i (x_i - x_hat_i)^2
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Val window = 2024-07-01 .. 2024-12-31, with **no anomaly filtering**.
+
+## Kept-guards (verbatim)
+
+A run is **kept** only if **all four** hold versus the current best in
+`results.tsv`:
+
+1. `val_metric` is strictly lower than the prior best kept `val_metric`.
+2. `train_mse > 1e-4`  — memorization guard. If the AE has collapsed training
+   loss to ~0, it has overfit.
+3. `latent_std_min > 0.05` — collapse guard. `latent_std_min = min over
+   bottleneck dims of std(z) across val rows`.
+4. `corr_with_F11 < 0.92` — differentiation guard. Pearson correlation of the
+   per-row val anomaly score against `F11_PCA_RECONSTRUCTION_ERROR_Z` on val
+   dates. Above 0.92 means the AE adds nothing over the existing linear PCA
+   baseline (F11) and has failed its job.
+
+If any guard fails, log the run, revert the branch.
+
+`train.py` already calls `prepare.evaluate_guards` and writes `kept` to
+`results.tsv`. Trust that. Read the printed `[guards]` line.
+
+## Git protocol (one branch per experiment)
 
 ```
-grep "^val_bpb:" run.log
+git checkout master
+git pull --ff-only                          # if remote exists
+git checkout -b autoresearch/<tag>
+# edit train.py
+python train.py --tag <tag>
+# inspect the [metric] and [guards] lines; check the last row of results.tsv
 ```
 
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
+If `kept=1`:
 ```
-commit	val_bpb	memory_gb	status	description
+git add train.py results.tsv runs/<tag>/
+git commit -m "<tag>: <one-line summary> (val_metric=<value>)"
+git checkout master
+git merge --no-ff autoresearch/<tag>
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
+If `kept=0`:
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+# results.tsv still gets the row (we keep the log of failed attempts).
+git checkout master
+git checkout -- train.py                    # revert your changes
+git branch -D autoresearch/<tag>            # discard the branch
+# optionally: stage results.tsv on master so the failed-run row persists
 ```
 
-## The experiment loop
+**One axis per branch.** Do not change architecture and optimizer in the
+same run — you will not know which knob moved the metric.
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+## Search directions (ordered by expected payoff)
 
-LOOP FOREVER:
+Run them roughly in this order. Each direction is one or more branches; one
+branch = one config change.
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+a. **Bottleneck width sweep:** 2, 4, 6, 8, 12. Default is 6.
+b. **Encoder/decoder depth:** add or remove a hidden layer (keep symmetric).
+c. **Hidden widths:** try `hidden1, hidden2` in {16,12}, {20,12}, {24,12}
+   (default), {32,16}, {48,24}.
+d. **Activation:** tanh (default) vs gelu vs leaky_relu.
+e. **Optimizer:** Adam (default) vs AdamW. `lr` in {5e-4, 1e-3, 2e-3}.
+   `weight_decay` in {0, 1e-5, 1e-4}.
+f. **Loss weighting:** uniform (default) vs inverse-volatility per tenor —
+   compute `per_tenor_std = train_X.std(axis=0)`, weight each squared
+   residual by `1 / max(per_tenor_std, eps)`. Affects training loss only;
+   `val_metric` stays unweighted (`prepare.compute_metric` is fixed).
+g. **Latent regularizer:** contractive penalty on the encoder Jacobian.
+   Coefficient in {0, 1e-4, 1e-3}. Add to the training loss only.
+h. **Optional input swap:** row-standardize (default) vs (log-price, then
+   per-tenor robust z). Only try after (a)-(g) plateau.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+## Stop conditions
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+Stop when **either** holds:
+- 50 branches attempted, OR
+- 3 hours of wall clock elapsed since the first branch in this session.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+## Conventions
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+- Time budget per run: 3 minutes wall clock (`--time_budget_s 180`,
+  enforced inside `train.py`). Pick `epochs`, `batch_size` that fit.
+- CPU only. Do not introduce `.cuda()`, `torch.compile`, or device flags.
+- Do not install new packages. Use what's in `requirements.txt`.
+- If a run crashes or NaNs, treat it as not-kept and revert the branch.
+- `runs/<tag>/model.pt` and `runs/<tag>/config.json` are written automatically.
+- The `--tag` arg should match the branch's tag (the bit after
+  `autoresearch/`).
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+That's it. Start with `git checkout -b autoresearch/<your-first-tag>` and
+make one small change.
