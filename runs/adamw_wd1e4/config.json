@@ -1,0 +1,27 @@
+{
+  "market": "TTF",
+  "bottleneck": 4,
+  "hidden1": 24,
+  "hidden2": 12,
+  "hidden_dims": "24",
+  "activation": "gelu",
+  "epochs": 200,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "optimizer": "adamw",
+  "seed": 0,
+  "log_every": 20,
+  "time_budget_s": 180,
+  "tag": "adamw_wd1e4",
+  "metrics": {
+    "val_metric": 1.1337393522262573,
+    "train_mse": 0.5513145082636853,
+    "latent_std_min": 0.2352007031440735,
+    "corr_with_F11": -0.22984561307756488
+  },
+  "kept": false,
+  "reasons": [
+    "val_metric 1.133739 not < best 1.102900"
+  ]
+}

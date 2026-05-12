@@ -87,7 +87,8 @@ def train_one_run(args):
         bottleneck=args.bottleneck,
         activation=args.activation,
     )
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_cls = torch.optim.AdamW if args.optimizer == "adamw" else torch.optim.Adam
+    opt = opt_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Per-element MSE summed over 36 tenors, mean over batch — per spec.
     def loss_fn(x_hat, x):
@@ -156,8 +157,9 @@ def main():
                    choices=list(_ACT.keys()))
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=128)
-    p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--lr",           type=float, default=2e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--optimizer",    type=str,   default="adam", choices=["adam", "adamw"])
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--log_every",    type=int,   default=20)
     p.add_argument("--time_budget_s",type=int,   default=180)  # 3 minutes / spec
