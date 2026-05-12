@@ -77,6 +77,14 @@ def train_one_run(args):
 
     train_loader, _val_loader = prepare.make_loaders(train_X, val_X, args.batch_size)
 
+    if args.loss_weight == "inv_vol":
+        per_tenor_std = train_X.std(axis=0)
+        w = 1.0 / np.maximum(per_tenor_std, 1e-6)
+        w = w * (len(w) / w.sum())  # normalize so mean weight = 1
+        tenor_weights = torch.tensor(w, dtype=torch.float32)
+    else:
+        tenor_weights = None
+
     if args.hidden_dims:
         hidden_dims = tuple(int(x) for x in args.hidden_dims.split(",") if x.strip())
     else:
@@ -92,17 +100,34 @@ def train_one_run(args):
 
     # Per-element MSE summed over 36 tenors, mean over batch — per spec.
     def loss_fn(x_hat, x):
-        return ((x_hat - x) ** 2).sum(dim=1).mean()
+        sq = (x_hat - x) ** 2
+        if tenor_weights is not None:
+            sq = sq * tenor_weights
+        return sq.sum(dim=1).mean()
 
     t0 = time.time()
     budget = args.time_budget_s
     train_mse_running = float("nan")
+    cae_coef = args.contractive
     for epoch in range(args.epochs):
         model.train()
         epoch_loss_sum, epoch_n = 0.0, 0
         for (xb,) in train_loader:
-            x_hat, _z = model(xb)
-            loss = loss_fn(x_hat, xb)
+            if cae_coef > 0:
+                xb_req = xb.detach().clone().requires_grad_(True)
+                z = model.encoder(xb_req)
+                x_hat = model.decoder(z)
+                recon_loss = loss_fn(x_hat, xb_req)
+                jac_sq = 0.0
+                for i in range(z.shape[1]):
+                    g = torch.autograd.grad(
+                        z[:, i].sum(), xb_req, create_graph=True, retain_graph=True
+                    )[0]
+                    jac_sq = jac_sq + (g ** 2).sum(dim=1)
+                loss = recon_loss + cae_coef * jac_sq.mean()
+            else:
+                x_hat, _z = model(xb)
+                loss = loss_fn(x_hat, xb)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -160,6 +185,10 @@ def main():
     p.add_argument("--lr",           type=float, default=2e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--optimizer",    type=str,   default="adam", choices=["adam", "adamw"])
+    p.add_argument("--loss_weight",  type=str,   default="uniform",
+                   choices=["uniform", "inv_vol"])
+    p.add_argument("--contractive",  type=float, default=1e-1,
+                   help="encoder-Jacobian penalty coefficient")
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--log_every",    type=int,   default=20)
     p.add_argument("--time_budget_s",type=int,   default=180)  # 3 minutes / spec
