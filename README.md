@@ -1,4 +1,74 @@
-# autoresearch
+# autoresearch: Shape AE
+
+Autonomous research loop (forked from [karpathy/autoresearch](https://github.com/karpathy/autoresearch)) retargeted from LLM pretraining to the **FERA Shape AE**. The aim is to find the best autoencoder for forward-curve **shape anomaly detection**, with the raw price curve and curve feature channels as inputs, and the price curve plus the 14 curve features as reconstruction outputs.
+
+An agent edits `train.py`, trains one model per market for a fixed 120 s budget, scores it with a fixed metric, keeps or discards the change, and repeats.
+
+## How it works
+
+- **`prepare.py`** (fixed, not modified by the agent):
+  - Loads curves: real data in `VW_ML_LONG` long format or M1..M36 wide format, or synthetic curves for the 7 FERA markets (TTF, THE, JKM, POWER_DE_BL, NORDIC, EUA, CSS_DE_BL).
+  - Applies the LOG / ASINH(p/10) transform.
+  - Builds the curve channels and the 14 features shown in the Regime AE feature-reconstruction chart.
+  - Applies the live-fold split (FIT calm days ≤ 2023-12-31 / early-stop / calibration / test from 2025-08-05) and robust scalers fitted on FIT only.
+  - Holds the **fixed evaluation** and the output export.
+- **`train.py`** (edited by the agent): the model, the inputs it uses, the loss, the optimizer and the training loop.
+- **`program.md`**: the agent's instructions, including the metric and the rules.
+
+### Inputs and reconstruction targets
+
+| Inputs (per market, per day) | |
+|---|---|
+| Curve channels (36 tenors) | `shape` (level-free T(price)), `dshape` (roll-aligned day change), `curve` (T(price) incl. level) |
+| Scalar features (14) | Return z, RV 21d, Corr 20d, Front-slope Δ, Slope Δ, Back-slope Δ, Curvature Δ, Winter–summer Δ, Basis Δ, Basis level z, PCA factor 1-4 (of the daily shape change, fitted on FIT) |
+
+The baseline model extends the deployed v3.1 architecture (`Conv1d k5 → k3 → Linear → z → mirror`) with a feature branch: an MLP encodes the 14 features, the two branches are concatenated into one latent `z` (L = 6), and two heads rebuild:
+
+1. **the curve shape**, which is re-anchored at the observed level to give the **price curve reconstruction** in native units;
+2. **the feature vector**, giving per-feature residuals in normalized feature space.
+
+### Metric
+
+Each test day gets an anomaly score of `max(curve RMS error / q99 calibration bar, feature RMS error / q99 calibration bar)`. **`val_score`** is the mean over markets of the AUPRC that separates clean test days from copies of test days with an **injected shape anomaly**: a kink, broken spread, front twist, seasonal hump or back-end bend, with features recomputed from the perturbed curve. A market whose clean-test shape EV is below 0.80 scores 0. Higher is better.
+
+The injection works the same way on real curves, so the metric needs no labelled event catalogue.
+
+### Outputs (each run, `~/.cache/autoresearch/shape_ae/outputs/`)
+
+- `<MKT>_scores.csv`: A_GLOBAL, A_R1..A_R4, A_BUTTERFLY_MAX, A_FEAT, BAR_MULTIPLE, DECISION, SEVERITY, driver region and driver feature, A_MAHAL, TRANSITION_SCORE, and latent Z1..ZL.
+- `<MKT>_curve_recon.csv`: observed vs reconstructed price per tenor, plus the scaled residual.
+- `<MKT>_feature_recon.csv`: observed vs reconstructed features, plus the residuals.
+- `<MKT>_latest.png`: price curve vs reconstruction, residual per tenor, and the feature residual bars for the latest day.
+
+## Quick start
+
+```bash
+uv sync
+uv run prepare.py                          # synthetic curves for the 7 markets (~15 s)
+# or: uv run prepare.py --curves curves.parquet   (TRADE_DATE, MARKET, MONTH_OFFSET, VALUE_NATIVE)
+uv run train.py                            # one experiment (~2 min, GPU if available else CPU)
+```
+
+Then point your agent at `program.md`:
+
+```
+Have a look at program.md and let's kick off a new experiment! Let's do the setup first.
+```
+
+## Project structure
+
+```
+prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
+train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
+program.md      — agent instructions
+pyproject.toml  — dependencies
+```
+
+---
+
+*The original LLM-pretraining README follows for reference.*
+
+## Original autoresearch
 
 ![teaser](progress.png)
 
