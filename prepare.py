@@ -34,7 +34,8 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 N_TENORS = 36            # monthly tenors M1..M36
-TIME_BUDGET = 120        # total training time budget in seconds (shared by all markets)
+TIME_BUDGET = 120        # total training time budget in seconds (shared by all seeds and markets)
+SEEDS = (1729, 2027, 7)  # every experiment trains and scores one model set per seed (mean = val_score)
 MIN_TRAIN_CURVES = 250   # below this many calm FIT rows, fall back to all FIT rows
 STRESS_WINDOW = 20       # trailing window for the calm filter (vol of dT(M1))
 Z_WINDOW, Z_MIN = 252, 63  # trailing window for return z / basis level z
@@ -87,7 +88,7 @@ MARKETS = {
 
 CACHE_DIR = os.environ.get("SHAPE_AE_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", "shape_ae"))
 DATA_DIR = os.path.join(CACHE_DIR, "markets")
-OUTPUT_DIR = os.path.join(CACHE_DIR, "outputs")
+OUTPUT_DIR = os.environ.get("SHAPE_AE_OUTPUT_DIR", os.path.join(CACHE_DIR, "outputs"))  # per-run in SPCS
 
 # ---------------------------------------------------------------------------
 # Price transform
@@ -649,7 +650,8 @@ W_TENOR, W_FEATURE = 0.7, 0.3 # weights of tenor vs feature attribution in the e
 EVENT_PRIOR = 20              # events weight w = n / (n + EVENT_PRIOR)
 FEATURE_TRUTH_MIN = 0.5       # injected days: a feature counts as moved if |delta| / its scale >= this
 REGION_QUANTILE = 0.90        # region normaliser = this quantile of calibration region RMS
-EVENTS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events", "events.csv")
+EVENTS_CSV = os.environ.get("SHAPE_AE_EVENTS_CSV",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "events", "events.csv"))
 EVENT_HOLDOUT_ENV = "SHAPE_AE_EVENT_HOLDOUT"  # set to 1 (human only) to also score the held-out half
 
 def _rms(x):
@@ -866,9 +868,20 @@ def evaluate_market(data, reconstruct_fn, holdout=None):
     return res
 
 def evaluate(reconstruct_fns):
-    """reconstruct_fns: {market: fn}. Returns (val_score, per-market results). See the header above."""
+    """reconstruct_fns: {market: fn}. Returns (score, per-market results) for ONE trained model set."""
     results = {m: evaluate_market(load_market(m), fn) for m, fn in reconstruct_fns.items()}
     return float(np.mean([r["score"] for r in results.values()])), results
+
+def evaluate_seeds(fns_by_seed):
+    """The official metric. fns_by_seed: {seed: {market: fn}} with exactly the seeds in SEEDS, each an
+    independently trained model set. Seed sensitivity is part of reliability: an alert rate that depends
+    on the seed is a model the desk cannot trust, so val_score is the mean over seeds.
+    Returns (val_score, val_score_std, {seed: (score, per-market results)})."""
+    if sorted(fns_by_seed) != sorted(SEEDS):
+        raise ValueError(f"evaluate_seeds needs exactly the seeds {SEEDS}, got {sorted(fns_by_seed)}")
+    per_seed = {s: evaluate(fns_by_seed[s]) for s in SEEDS}
+    scores = np.array([per_seed[s][0] for s in SEEDS])
+    return float(scores.mean()), float(scores.std()), per_seed
 
 # ---------------------------------------------------------------------------
 # Outputs: price-curve + feature reconstruction per day, explanation, Shape AE scores, plots

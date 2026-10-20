@@ -47,6 +47,18 @@ number_col = "VALUE_NUMBER"
 string_col = "VALUE_STRING"
 model_id = 3
 
+[spcs]
+# Snowpark Container Services job runner (spcs_run.py). Placeholders: fill in before the first run.
+database = "FERA_DB"                      # database / schema holding the objects below
+schema = "SHAPE_AE"
+compute_pool = "SHAPE_AE_GPU_POOL"        # GPU pool, e.g. instance family GPU_NV_S
+image_repository = "SHAPE_AE_IMAGES"      # image repository name (in database.schema)
+image_name = "shape-ae"
+stage = "SHAPE_AE_STAGE"                  # internal stage (SNOWFLAKE_SSE) mounted at /stage in every job
+gpus = 1                                  # nvidia.com/gpu per job (0 = CPU pool)
+job_timeout_minutes = 15                  # an experiment that runs longer is treated as failed
+query_warehouse = ""                      # warehouse for the job's own Snowflake queries (prepare)
+
 [features]
 # "computed": all 14 features computed in-repo from the curves.
 # "snowflake": clean-day values read from the feature store for the columns mapped below;

@@ -59,6 +59,8 @@ def connect(cfg):
     sf = cfg["snowflake"]
     opts = {k: sf[k] for k in ("warehouse", "role", "database") if sf.get(k)}
     if os.path.exists(SPCS_TOKEN):
+        if os.environ.get("SHAPE_AE_WAREHOUSE") and "warehouse" not in opts:
+            opts["warehouse"] = os.environ["SHAPE_AE_WAREHOUSE"]
         with open(SPCS_TOKEN) as f:
             token = f.read().strip()
         return snowflake.connector.connect(

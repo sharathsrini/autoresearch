@@ -82,6 +82,25 @@ uv run prepare.py --curves curves.csv      # ENTITY_IDs are mapped to market nam
 
 See `events/README.md` for the labelling guide. Tests: `python tests/test_events.py`. Planted events must be found, with the right tenors.
 
+## Running on Snowpark Container Services (step 4)
+
+`spcs_run.py` runs everything as SPCS jobs on a GPU compute pool. The agent runs on your machine and only needs a Snowflake login.
+
+- **One image** holds the fixed harness. Its tag is a hash of the harness files, so a run refuses to start if the image doesn't match your checkout. Each experiment ships only its `train.py`, plus `events/events.csv`, to `@SHAPE_AE_STAGE/runs/<run id>/`. That stage is mounted at `/stage` in every job.
+- **Data** is prepared inside SPCS (`spcs_run.py prepare`) with the job's own session token, into `/stage/cache`.
+- **Each run** is started asynchronously and polled. On timeout it is killed. The service is always dropped, and `run.log`, the exit code and the outputs are fetched to `./runs/<run id>/`.
+
+One-time setup:
+
+```bash
+# 1. In Snowflake: edit names, then run spcs/setup.sql (compute pool, image repository, stage, grants)
+# 2. Fill the [spcs] section of fera.toml with the same names
+uv run spcs_run.py build                        # docker build + push (log in: snow spcs image-registry login)
+uv run spcs_run.py tests                        # harness tests inside the image, on the pool
+uv run spcs_run.py prepare --markets TTF,THE    # Snowflake pull inside SPCS -> /stage/cache
+uv run spcs_run.py train > run.log 2>&1         # one experiment (what the agent runs)
+```
+
 ## Quick start
 
 ```bash
@@ -104,7 +123,9 @@ Have a look at program.md and let's kick off a new experiment! Let's do the setu
 fera.toml       — data-source config: markets, Snowflake view/columns, entity map, feature store (no secrets)
 data_sources.py — Snowflake pulls, content-hashed snapshots, data-quality checks (do not modify)
 events.py       — event catalogue: mine candidates, load labels (events/events.csv is tracked)
-tests/          — data, event and metric tests (fake Snowflake connector, planted events, oracle model)
+spcs_run.py     — SPCS job runner: build image, prepare, train, tests (do not modify)
+spcs/           — Dockerfile, job entrypoint, one-time setup SQL
+tests/          — data, event, metric and runner tests (fake Snowflake connector, planted events, oracle model)
 prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
 train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
 program.md      — agent instructions

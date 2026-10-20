@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prepare import (N_TENORS, N_FEATURES, TIME_BUDGET, list_markets, load_market,
-                     evaluate, export_outputs, OUTPUT_DIR)
+from prepare import (N_TENORS, N_FEATURES, TIME_BUDGET, SEEDS, list_markets, load_market,
+                     evaluate_seeds, export_outputs, OUTPUT_DIR)
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -46,7 +46,6 @@ DSHAPE_LOSS_WEIGHT = 1.0  # weight of day-change reconstruction vs shape reconst
 FEAT_LOSS_WEIGHT = 1.0    # weight of feature reconstruction vs shape reconstruction
 MAX_EPOCHS = 200
 PATIENCE = 15           # early stop on the early-stop split
-SEED = 1729
 
 # ---------------------------------------------------------------------------
 # Model
@@ -126,9 +125,9 @@ def make_reconstruct_fn(model, device):
 # Training (one model per market, equal share of the time budget)
 # ---------------------------------------------------------------------------
 
-def train_market(market, budget_s, device):
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+def train_market(market, budget_s, device, seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     data = load_market(market)
     fit = to_tensors(data.batch("fit"), device)
     es = to_tensors(data.batch("early_stop"), device)
@@ -164,7 +163,7 @@ def train_market(market, budget_s, device):
         if bad >= PATIENCE or time.time() - t0 >= budget_s:
             break
     model.load_state_dict(best_state)
-    print(f"  {market:12s} fit={n:5d} epochs={epoch:3d} steps={steps:5d} best_es_loss={best:.5f} "
+    print(f"  seed {seed:5d} {market:12s} fit={n:5d} epochs={epoch:3d} steps={steps:5d} best_es_loss={best:.5f} "
           f"({time.time() - t0:.1f}s)")
     return model, steps
 
@@ -175,36 +174,44 @@ def train_market(market, budget_s, device):
 t_start = time.time()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.deterministic = True  # same code + same seeds = same score on GPU too
+torch.backends.cudnn.benchmark = False
 markets = list_markets()
 print(f"Device: {device} | markets: {markets} | time budget: {TIME_BUDGET}s")
 
-per_market_budget = TIME_BUDGET / len(markets)
+per_model_budget = TIME_BUDGET / (len(SEEDS) * len(markets))
 models, total_steps = {}, 0
 t_train = time.time()
-for m in markets:
-    models[m], s = train_market(m, per_market_budget, device)
-    total_steps += s
+for seed in SEEDS:  # one independently trained model set per seed (fixed list, see prepare.SEEDS)
+    for m in markets:
+        models[seed, m], s = train_market(m, per_model_budget, device, seed)
+        total_steps += s
 training_seconds = time.time() - t_train
 
-fns = {m: make_reconstruct_fn(models[m], device) for m in markets}
-val_score, results = evaluate(fns)
+fns = {seed: {m: make_reconstruct_fn(models[seed, m], device) for m in markets} for seed in SEEDS}
+val_score, val_std, per_seed = evaluate_seeds(fns)
 for m in markets:
-    export_outputs(m, fns[m])
+    export_outputs(m, fns[SEEDS[0]][m])
 
-num_params = sum(p.numel() for p in models[markets[0]].parameters())
+num_params = sum(p.numel() for p in models[SEEDS[0], markets[0]].parameters())
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0.0
-mean = lambda k: float(np.mean([r[k] for r in results.values()]))
+all_results = [r for _, res in per_seed.values() for r in res.values()]
+mean = lambda k: float(np.mean([r[k] for r in all_results]))
 
 print("---")
-for m, r in results.items():
-    e = r["events"]
-    print(f"market {m:12s} score={r['score']:.4f} inj={r['inj_score']:.4f} recall={r['recall']:.3f} "
-          f"tenor_acc={r['tenor_acc']:.3f} feature_acc={r['feature_acc']:.3f} alert_rate={r['alert_rate']:.3f} "
-          f"alert_factor={r['gates']['alert_factor']:.2f} ev={r['recon_ev']:.3f} events={e['n_events']} "
-          f"event_recall={e['recall']:.3f} regions={r['region_share']}")
-    print(f"  by type: " + "  ".join(f"{k}={v['recall']:.2f}/{v['tenor_acc'] if v['tenor_acc'] is not None else 0:.2f}"
-                                   for k, v in r["recall_by_type"].items()) + "  (recall/tenor_acc)")
+for seed, (score, res) in per_seed.items():
+    print(f"seed {seed}: score={score:.4f}")
+    for m, r in res.items():
+        e = r["events"]
+        print(f"  {m:12s} score={r['score']:.4f} inj={r['inj_score']:.4f} recall={r['recall']:.3f} "
+              f"tenor_acc={r['tenor_acc']:.3f} feature_acc={r['feature_acc']:.3f} alert_rate={r['alert_rate']:.3f} "
+              f"alert_factor={r['gates']['alert_factor']:.2f} ev={r['recon_ev']:.3f} events={e['n_events']} "
+              f"event_recall={e['recall']:.3f} regions={r['region_share']}")
+        print(f"    by type: " + "  ".join(
+            f"{k}={v['recall']:.2f}/{v['tenor_acc'] if v['tenor_acc'] is not None else 0:.2f}"
+            for k, v in r["recall_by_type"].items()) + "  (recall/tenor_acc)")
 print(f"val_score:        {val_score:.6f}")
+print(f"val_score_std:    {val_std:.6f}")
 print(f"mean_recall:      {mean('recall'):.6f}")
 print(f"mean_tenor_acc:   {mean('tenor_acc'):.6f}")
 print(f"mean_feature_acc: {mean('feature_acc'):.6f}")
@@ -212,7 +219,7 @@ print(f"mean_alert_rate:  {mean('alert_rate'):.6f}")
 print(f"mean_recon_ev:    {mean('recon_ev'):.6f}")
 print(f"mean_auprc:       {mean('auprc'):.6f}")
 print(f"price_mape:       {mean('price_mape'):.6f}")
-print(f"n_dev_events:     {sum(r['events']['n_events'] for r in results.values())}")
+print(f"n_dev_events:     {sum(r['events']['n_events'] for r in per_seed[SEEDS[0]][1].values())}")
 print(f"training_seconds: {training_seconds:.1f}")
 print(f"total_seconds:    {time.time() - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")

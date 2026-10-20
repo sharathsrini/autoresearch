@@ -2,7 +2,7 @@
 
 This is an experiment to have the LLM do its own research: find the best autoencoder for **forward-curve shape anomaly detection**.
 
-The model takes the raw forward curve of one market (M1..M36) together with feature channels of that curve. It has to rebuild **both** the price curve and the 14 scalar curve features from a narrow latent code. A day it cannot rebuild well is a shape anomaly.
+The model takes the raw forward curve of one market (M1..M36) together with feature channels of that curve. It has to rebuild the curve shape, the day change of the shape and the 14 scalar curve features from a narrow latent code. A day it cannot rebuild well is a shape anomaly, and its residuals must say where on the curve and which feature.
 
 ## Setup
 
@@ -14,7 +14,11 @@ To set up a new experiment, work with the user to:
    - `README.md`: repository context.
    - `prepare.py`: fixed constants, data prep, features, splits, scalers, anomaly injection, evaluation and output export. Do not modify.
    - `train.py`: the file you modify. Model architecture, inputs used, loss, optimizer, training loop.
-4. **Verify data exists**: check that `~/.cache/autoresearch/shape_ae/markets/` contains `meta.json` and one `.npz` per market. If not, tell the human to run `uv run prepare.py --source snowflake` (real curves), `uv run prepare.py --curves <file>`, or `uv run prepare.py` (synthetic). Note the `snapshot_id` in `meta.json`. All runs in one session must use the same snapshot, otherwise their scores are not comparable. `fera.toml`, `data_sources.py` and `tests/` are fixed like `prepare.py`.
+4. **Verify the runner and data**: experiments run on Snowpark Container Services through `spcs_run.py`.
+   - Check that `uv run spcs_run.py tag` prints a tag. Ask the human to confirm that the image with that tag is pushed (`uv run spcs_run.py build`) and that the prepared data is on the stage (`uv run spcs_run.py prepare`).
+   - When working locally instead (`--local`), check that `~/.cache/autoresearch/shape_ae/markets/meta.json` exists; if not, ask the human to run `uv run prepare.py`.
+   - Note the `snapshot_id` that `prepare` prints. All runs in one session must use the same snapshot, otherwise their scores are not comparable.
+   - `fera.toml`, `data_sources.py`, `events.py`, `spcs_run.py`, `spcs/` and `tests/` are fixed like `prepare.py`. Changing them changes the image tag, and runs then refuse to start until a new image is pushed.
 5. **Initialize results.tsv**: create `results.tsv` with just the header row. The baseline is recorded after the first run.
 6. **Confirm and go**: confirm the setup looks good.
 
@@ -58,7 +62,9 @@ The model rebuilds three targets: `shape` (the state of the curve), `dshape` (wh
    - **blend**: `S = (1−w)·S_inj + w·S_ev`, with `w = n_events / (n_events + 20)`. The event weight grows as the human labels more events.
    - **gates**: `S = 0` if the clean-test shape EV < 0.80. `S` is multiplied by an **alert factor**: 1 when the alert rate on out-of-calibration days (early-stop + test) is within 5–10%, falling linearly to 0 at 0% and at 20%. This punishes models that drift into alarm storms or go silent outside calibration.
 
-**`val_score` = mean of `S` over markets. Higher is better.** For orientation on synthetic data:
+**Seeds.** Every experiment trains one independent model set per seed in `prepare.SEEDS` (3 seeds) and scores each one. `val_score` is the mean over seeds, and `val_score_std` is the spread. A model whose alert rate or explanations depend on its seed is not reliable, so consistency is part of the score. Do not change the seed list or pick favourable seeds. Ensembling several networks inside one seed's model set is allowed.
+
+**`val_score` = mean of `S` over markets, averaged over the 3 seeds. Higher is better.** For orientation on synthetic data:
 - a linear PCA autoencoder scores about 0.42;
 - an oracle that rebuilds the clean version of every injected day scores about 0.6.
 
@@ -73,7 +79,7 @@ A wide bottleneck rebuilds the anomalies too, and recall collapses. Simply copyi
 
 ## Experimentation
 
-Each run trains one model per market inside a **fixed total time budget of 120 s** (`TIME_BUDGET` in `prepare.py`, split equally across markets). Then it evaluates and writes the outputs. Launch it with: `uv run train.py`. It runs on GPU if one is available, otherwise on CPU.
+Each run trains one model per market inside a **fixed total time budget of 120 s** (`TIME_BUDGET` in `prepare.py`, split equally across markets). Then it evaluates and writes the outputs. Launch it with `uv run spcs_run.py train`: it uploads `train.py`, runs it on the GPU compute pool and prints the run log. `uv run spcs_run.py train --local` runs it on this machine with the same output. Logs and outputs of every run are kept in `./runs/<run id>/`.
 
 **What you CAN do:**
 - Modify `train.py`. It is the only file you edit. Everything is fair game: which input channels to use (`shape`, `dshape`, `curve`, `month`), how the features are fused, the encoder/decoder (conv, dilations, attention over tenors, MLP), latent size, latent regularisation (VAE/KL, sparsity, contractive, Mahalanobis whitening), denoising/masking schemes, loss (Huber/MSE/weighted per tenor, curve vs feature weight), optimizer, schedule, early stopping, ensembling and seeds.
@@ -92,26 +98,37 @@ Each run trains one model per market inside a **fixed total time budget of 120 s
 
 ## Output format
 
-When the script finishes it prints a per-market breakdown and a summary like this:
+When the run finishes it prints a breakdown per seed and market, then a summary averaged over seeds. Real output of the baseline on synthetic data:
 
 ```
-market TTF          score=0.4120 inj=0.4120 recall=0.780 tenor_acc=0.610 feature_acc=0.700 alert_rate=0.068 alert_factor=1.00 ev=0.975 events=0 event_recall=nan regions={...}
-  by type: kink=0.40/0.98  broken_spread=0.85/0.66  front_twist=0.93/0.45  seasonal_hump=1.00/0.75  back_bend=0.90/0.45  (recall/tenor_acc)
-...
 ---
-val_score:        0.412000
-mean_recall:      0.780000
-mean_tenor_acc:   0.610000
-mean_feature_acc: 0.700000
-mean_alert_rate:  0.068000
-mean_recon_ev:    0.975000
+seed 1729: score=0.0956
+  TTF          score=0.1609 inj=0.3902 recall=0.780 tenor_acc=0.498 feature_acc=0.504 alert_rate=0.021 alert_factor=0.41 ev=0.917 ...
+    by type: kink=0.38/1.00  broken_spread=0.78/0.62  front_twist=0.95/0.39  seasonal_hump=0.95/0.38  back_bend=0.83/0.41  (recall/tenor_acc)
+  THE          score=0.0304 ... alert_rate=0.192 alert_factor=0.08 ...
+seed 2027: score=0.1677
+seed 7: score=0.0823
+val_score:        0.115228
+val_score_std:    0.037534
+mean_recall:      0.784444
+mean_tenor_acc:   0.459379
+mean_feature_acc: 0.501806
+mean_alert_rate:  0.106186
+mean_recon_ev:    0.893350
 ...
 ```
+
+Read the baseline like this:
+- Detection is fine (recall 0.78).
+- Explanations are mediocre (tenor accuracy 0.46).
+- The score is mostly lost to the **alert factor**: the alert rate outside calibration is 2% for TTF and 19% for THE, so the model's error level drifts.
+
+The obvious first targets are stable out-of-calibration behaviour and sharper, localised residuals.
 
 Extract the key metric with:
 
 ```
-grep "^val_score:\|^mean_tenor_acc:\|^mean_alert_rate:" run.log
+grep "^val_score:\|^val_score_std:\|^mean_tenor_acc:\|^mean_alert_rate:" run.log
 ```
 
 The per-type line shows where to look. Low kink recall means the model smooths kinks back in. Low tenor accuracy on back bends means back-end residuals smear.
@@ -127,27 +144,28 @@ Each run also writes outputs to `~/.cache/autoresearch/shape_ae/outputs/`:
 
 When an experiment is done, log it to `results.tsv`. Use tabs, not commas, because commas break the descriptions.
 
-The TSV has a header row and 6 columns:
+The TSV has a header row and 7 columns:
 
 ```
-commit	val_score	tenor_acc	alert_rate	status	description
+commit	val_score	val_std	tenor_acc	alert_rate	status	description
 ```
 
 1. git commit hash (short, 7 chars)
 2. val_score achieved (e.g. 0.412345). Use 0.000000 for crashes.
-3. mean_tenor_acc (e.g. 0.610). Use 0.000 for crashes.
-4. mean_alert_rate (e.g. 0.068). Use 0.000 for crashes.
-5. status: `keep`, `discard`, or `crash`
-6. a short description of what the experiment tried
+3. val_score_std (e.g. 0.031). Use 0.000 for crashes.
+4. mean_tenor_acc (e.g. 0.610). Use 0.000 for crashes.
+5. mean_alert_rate (e.g. 0.068). Use 0.000 for crashes.
+6. status: `keep`, `discard`, or `crash`
+7. a short description of what the experiment tried
 
 Example:
 
 ```
-commit	val_score	tenor_acc	alert_rate	status	description
-a1b2c3d	0.912345	0.975	0.010	keep	baseline
-b2c3d4e	0.925100	0.968	0.009	keep	latent 6 -> 4
-c3d4e5f	0.901000	0.990	0.020	discard	add curve (level) channel
-d4e5f6g	0.000000	0.000	0.000	crash	attention encoder (shape bug)
+commit	val_score	val_std	tenor_acc	alert_rate	status	description
+a1b2c3d	0.115228	0.038	0.459	0.106	keep	baseline
+b2c3d4e	0.161000	0.021	0.470	0.081	keep	latent 6 -> 4
+c3d4e5f	0.109000	0.045	0.450	0.120	discard	add curve (level) channel
+d4e5f6g	0.000000	0.000	0.000	0.000	crash	attention encoder (shape bug)
 ```
 
 ## The experiment loop
@@ -159,16 +177,16 @@ LOOP FOREVER:
 1. Look at the git state: the current branch and commit.
 2. Change `train.py` to try an experimental idea.
 3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1`. Redirect everything; do NOT use tee or let the output flood your context.
-5. Read the results: `grep "^val_score:\|^mean_tenor_acc:\|^mean_alert_rate:" run.log`
+4. Run the experiment: `uv run spcs_run.py train > run.log 2>&1` (or with `--local`). Redirect everything; do NOT use tee or let the output flood your context. A line `FAIL` at the end means the job failed or timed out.
+5. Read the results: `grep "^val_score:\|^val_score_std:\|^mean_tenor_acc:\|^mean_alert_rate:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix. If you can't get it working after a few attempts, give up on that idea.
 7. Record the results in the TSV. Do not commit `results.tsv`; leave it untracked by git.
-8. If val_score improved (higher), "advance" the branch by keeping the commit.
+8. If val_score improved (higher) by more than noise, "advance" the branch by keeping the commit. Runs are deterministic (same code gives the same score), but a code change also changes what each seed "draws". Treat a gain smaller than half of `val_score_std` as noise, unless the change also simplifies the code.
 9. If val_score is equal or worse, `git reset` back to where you started.
 
 You are a fully autonomous researcher: try things out, keep what works and discard what doesn't. Rewind the branch only very sparingly, if ever.
 
-**Timeout**: each experiment should take about 2-3 minutes in total. If a run exceeds 6 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: training takes up to 2 minutes (3 seeds x markets share the budget). SPCS adds start-up time, so a whole run is typically 3–6 minutes. The job is killed after 15 minutes (`job_timeout_minutes` in `fera.toml`) and reported as `FAIL`; treat that as a failure (discard and revert). If the compute pool is suspended, the first run of a session can take a few minutes longer.
 
 **Crashes**: if the cause is something dumb and easy to fix (a typo, a shape mismatch), fix it and re-run. If the idea itself is broken, skip it, log `crash`, and move on.
 

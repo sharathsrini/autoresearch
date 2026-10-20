@@ -126,6 +126,19 @@ def test_events_scored_with_dev_holdout_split():
     assert dev["recall"] == 1.0 and dev["tenor_acc"] == 1.0 and dev["feature_acc"] == 1.0
     assert abs(r["event_weight"] - dev["n_events"] / (dev["n_events"] + P.EVENT_PRIOR)) < 1e-12
 
+def test_seed_list_is_fixed():
+    ready()
+    fn = pca_fn("TTF")
+    ok = {s: {"TTF": fn} for s in P.SEEDS}
+    mean, std, per = P.evaluate_seeds(ok)
+    assert std == 0.0 and abs(mean - per[P.SEEDS[0]][0]) < 1e-12
+    for bad in [{1: {"TTF": fn}}, {**ok, 99: {"TTF": fn}}]:
+        try:
+            P.evaluate_seeds(bad)
+        except ValueError:
+            continue
+        raise AssertionError("non-standard seed list accepted")
+
 def test_export_outputs_explain_flagged_days():
     ready()
     out = os.path.join(os.environ["SHAPE_AE_CACHE"], "out")
