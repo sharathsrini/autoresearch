@@ -1,4 +1,142 @@
-# autoresearch
+# autoresearch: Shape AE
+
+Autonomous research loop (forked from [karpathy/autoresearch](https://github.com/karpathy/autoresearch)) retargeted from LLM pretraining to the **FERA Shape AE**. The aim is to find the best autoencoder for forward-curve **shape anomaly detection**, with the raw price curve and curve feature channels as inputs, and the price curve plus the 14 curve features as reconstruction outputs.
+
+An agent edits `train.py`, trains one model per market for a fixed 120 s budget, scores it with a fixed metric, keeps or discards the change, and repeats.
+
+## How it works
+
+- **`prepare.py`** (fixed, not modified by the agent):
+  - Loads curves: real data in `VW_ML_LONG` long format or M1..M36 wide format, or synthetic curves for the 7 FERA markets (TTF, THE, JKM, POWER_DE_BL, NORDIC, EUA, CSS_DE_BL).
+  - Applies the LOG / ASINH(p/10) transform.
+  - Builds the curve channels and the 14 features shown in the Regime AE feature-reconstruction chart.
+  - Applies the live-fold split (FIT calm days ≤ 2023-12-31 / early-stop / calibration / test from 2025-08-05) and robust scalers fitted on FIT only.
+  - Holds the **fixed evaluation** and the output export.
+- **`train.py`** (edited by the agent): the model, the inputs it uses, the loss, the optimizer and the training loop.
+- **`program.md`**: the agent's instructions, including the metric and the rules.
+
+### Inputs and reconstruction targets
+
+| Inputs (per market, per day) | |
+|---|---|
+| Curve channels (36 tenors) | `shape` (level-free T(price)), `dshape` (roll-aligned day change), `curve` (T(price) incl. level) |
+| Scalar features (14) | Return z, RV 21d, Corr 20d, Front-slope Δ, Slope Δ, Back-slope Δ, Curvature Δ, Winter–summer Δ, Basis Δ, Basis level z, PCA factor 1-4 (of the daily shape change, fitted on FIT) |
+
+The baseline model extends the deployed v3.1 architecture (`Conv1d k5 → k3 → Linear → z → mirror`) with a feature branch: an MLP encodes the 14 features, the two branches are concatenated into one latent `z` (L = 6), and two heads rebuild:
+
+1. **the curve shape**, which is re-anchored at the observed level to give the **price curve reconstruction** in native units;
+2. **the feature vector**, giving per-feature residuals in normalized feature space.
+
+### Metric (step 3: explain-first)
+
+The model rebuilds the curve shape, its day change (`dshape`) and the 14 features. `prepare.py` turns the residuals into a decision and an explanation, normalising every tenor and feature by its calibration residual so no tenor, feature or region is favoured. Bars are set so that 7.5% of calibration days alert, matching the desk's 5–10% target.
+
+Per market, `S = recall × (0.7·tenor accuracy + 0.3·feature accuracy)`:
+- on **injected anomalies**, where the true tenors and features are known;
+- on **labelled events** from `events/events.csv`, blended in with weight `n/(n+20)` as the catalogue grows. Half the events are held out for human-only checks.
+
+Gates: shape EV ≥ 0.80, and an alert factor that drops to 0 when the out-of-calibration alert rate leaves 5–10%.
+
+**`val_score`** is the mean over markets; higher is better. On synthetic data, a linear PCA AE scores about 0.42 and an oracle about 0.6. Copying the input scores 0.
+
+### Outputs (each run, `~/.cache/autoresearch/shape_ae/outputs/`, every day from 2024-02)
+
+- `<MKT>_scores.csv`: DECISION, SEVERITY, TRIGGER, **DRIVER_TENORS** (e.g. `M7-M9`), DRIVER_TENOR with its **gap in price units**, **DRIVER_FEATURE**, DRIVER_REGION, an **EXPLANATION** sentence, A_GLOBAL, regions, A_MAHAL, TRANSITION_SCORE and the latent code.
+- `<MKT>_curve_recon.csv`: observed vs reconstructed price per tenor, gap in price units, normalised residual.
+- `<MKT>_feature_recon.csv`: observed vs reconstructed features, normalised residuals.
+- `<MKT>_latest.png`: the latest flagged day, with driver tenors in red and the feature residual bars.
+
+## Data (step 1: Snowflake source, snapshots, data quality)
+
+`fera.toml` holds the data-source config: active markets (GAS first, so `TTF`, `THE`), the curve view and its columns, the ENTITY_ID → market map, and the optional feature-store mapping. It contains no secrets.
+
+- **Sources:** `--source snowflake` pulls the long view; `--curves file` reads a parquet/CSV export; the default is synthetic curves. Basis-reference markets are pulled automatically.
+- **Auth, tried in order:** the SPCS session token, then `connection_name` in `~/.snowflake/connections.toml`, then `SNOWFLAKE_*` env vars. Install with `uv sync --extra snowflake`.
+- **Snapshots:** every pull is saved once under a content-hash id (`SNAP_<16 hex>`). The hash is verified on every load, and the id is recorded in each market's meta, so every experiment names the exact data it ran on. `--snapshot SNAP_...` re-prepares one without pulling; `--list-snapshots` lists them.
+- **Data-quality gate:** checks for duplicate keys, incomplete or non-positive rows, stale (carried-forward) days, gaps, weekend dates and bad-tick jumps. Duplicates and too few complete curves stop the run unless you pass `--allow-dq-fail`.
+- **Feature store** (`[features] source = "snowflake"`): mapped features use store values on clean days. Unmapped features and the PCA factors stay computed, because PCA must be fitted inside the fold. Injected days get the store value plus the computed effect of the perturbation, so the evaluation stays consistent. A parity report (corr and std ratio, computed vs store) is printed and saved per market.
+- **Tests:** `python tests/test_data_sources.py` runs against a fake Snowflake connector, so no account is needed.
+
+**SnowSQL login:** set `snowsql_connection = "<name>"` in `fera.toml` to reuse `[connections.<name>]` from `~/.snowsql/config`. A key-pair passphrase is read from `PRIVATE_KEY_PASSPHRASE`, the same env var SnowSQL uses. Fallback without the Python connector: export with SnowSQL and use the file route.
+
+```bash
+snowsql -c <name> -o output_format=csv -o header=true -o timing=false -o friendly=false \
+  -q "SELECT TRADE_DATE, ENTITY_ID, MONTH_OFFSET, VALUE_NATIVE FROM RW_CF_FERA.VW_ML_LONG
+      WHERE ENTITY_ID IN (1,2) AND MONTH_OFFSET BETWEEN 1 AND 36" > curves.csv
+uv run prepare.py --curves curves.csv      # ENTITY_IDs are mapped to market names via fera.toml
+```
+
+**Roll days:** on the first trading day of a month, yesterday's curve is shifted one tenor (ALIGN). Today's M36 was not quoted yesterday, so it is estimated as M25 + (M36 − M24). Without this, every roll day showed a fake M36 jump in `dshape`, Back-slope Δ and the PCA factors.
+
+## Event catalogue (step 2)
+
+`events.py` builds the labelled catalogue that the evaluation will use:
+
+- `mine` proposes candidates from two independent sources:
+  - **CURVE**, model-free: robust z against the trailing year of the roll-aligned shape change per tenor, the tenor kink, and the spread features;
+  - **SHAPE_AE**: live alert days from `AN_FERA.MODEL_SCORES`.
+
+  It adds 20 random **CONTROL** days per market, writes `events/candidates_<SNAP>.csv` with suggested tenors and features, and leaves the label columns blank.
+- `load` validates your labels (label values, tenor syntax, feature names, dates) and merges them into the git-tracked `events/events.csv`.
+- `stats` summarises the catalogue.
+
+See `events/README.md` for the labelling guide. Tests: `python tests/test_events.py`. Planted events must be found, with the right tenors.
+
+## Running on Snowpark Container Services (step 4)
+
+`spcs_run.py` runs everything as SPCS jobs on a GPU compute pool. The agent runs on your machine and only needs a Snowflake login.
+
+- **One image** holds the fixed harness. Its tag is a hash of the harness files, so a run refuses to start if the image doesn't match your checkout. Each experiment ships only its `train.py`, plus `events/events.csv`, to `@SHAPE_AE_STAGE/runs/<run id>/`. That stage is mounted at `/stage` in every job.
+- **Data** is prepared inside SPCS (`spcs_run.py prepare`) with the job's own session token, into `/stage/cache`.
+- **Each run** is started asynchronously and polled. On timeout it is killed. The service is always dropped, and `run.log`, the exit code and the outputs are fetched to `./runs/<run id>/`.
+
+One-time setup:
+
+```bash
+# 1. In Snowflake: edit names, then run spcs/setup.sql (compute pool, image repository, stage, grants)
+# 2. Fill the [spcs] section of fera.toml with the same names
+uv run spcs_run.py build                        # docker build + push (log in: snow spcs image-registry login)
+uv run spcs_run.py tests                        # harness tests inside the image, on the pool
+uv run spcs_run.py prepare --markets TTF,THE    # Snowflake pull inside SPCS -> /stage/cache
+uv run spcs_run.py train > run.log 2>&1         # one experiment (what the agent runs)
+```
+
+## Quick start
+
+```bash
+uv sync
+uv run prepare.py                          # synthetic curves, active markets from fera.toml
+# or: uv sync --extra snowflake && uv run prepare.py --source snowflake
+# or: uv run prepare.py --curves curves.parquet   (TRADE_DATE, MARKET, MONTH_OFFSET, VALUE_NATIVE)
+uv run train.py                            # one experiment (~2 min, GPU if available else CPU)
+```
+
+Then point your agent at `program.md`:
+
+```
+Have a look at program.md and let's kick off a new experiment! Let's do the setup first.
+```
+
+## Project structure
+
+```
+fera.toml       — data-source config: markets, Snowflake view/columns, entity map, feature store (no secrets)
+data_sources.py — Snowflake pulls, content-hashed snapshots, data-quality checks (do not modify)
+events.py       — event catalogue: mine candidates, load labels (events/events.csv is tracked)
+spcs_run.py     — SPCS job runner: build image, prepare, train, tests (do not modify)
+spcs/           — Dockerfile, job entrypoint, one-time setup SQL
+tests/          — data, event, metric and runner tests (fake Snowflake connector, planted events, oracle model)
+prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
+train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
+program.md      — agent instructions
+pyproject.toml  — dependencies
+```
+
+---
+
+*The original LLM-pretraining README follows for reference.*
+
+## Original autoresearch
 
 ![teaser](progress.png)
 
@@ -17,6 +155,17 @@ The repo is deliberately kept small and only really has three files that matter:
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+
+## Data (step 1: Snowflake source, snapshots, data quality)
+
+`fera.toml` holds the data-source config: active markets (GAS first, so `TTF`, `THE`), the curve view and its columns, the ENTITY_ID → market map, and the optional feature-store mapping. It contains no secrets.
+
+- **Sources:** `--source snowflake` pulls the long view; `--curves file` reads a parquet/CSV export; the default is synthetic curves. Basis-reference markets are pulled automatically.
+- **Auth, tried in order:** the SPCS session token, then `connection_name` in `~/.snowflake/connections.toml`, then `SNOWFLAKE_*` env vars. Install with `uv sync --extra snowflake`.
+- **Snapshots:** every pull is saved once under a content-hash id (`SNAP_<16 hex>`). The hash is verified on every load, and the id is recorded in each market's meta, so every experiment names the exact data it ran on. `--snapshot SNAP_...` re-prepares one without pulling; `--list-snapshots` lists them.
+- **Data-quality gate:** checks for duplicate keys, incomplete or non-positive rows, stale (carried-forward) days, gaps, weekend dates and bad-tick jumps. Duplicates and too few complete curves stop the run unless you pass `--allow-dq-fail`.
+- **Feature store** (`[features] source = "snowflake"`): mapped features use store values on clean days. Unmapped features and the PCA factors stay computed, because PCA must be fitted inside the fold. Injected days get the store value plus the computed effect of the perturbation, so the evaluation stays consistent. A parity report (corr and std ratio, computed vs store) is printed and saved per market.
+- **Tests:** `python tests/test_data_sources.py` runs against a fake Snowflake connector, so no account is needed.
 
 ## Quick start
 

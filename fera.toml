@@ -1,0 +1,79 @@
+# Data-source configuration for Shape AE autoresearch (read by prepare.py / data_sources.py).
+# No secrets here. Snowflake auth comes from, in order:
+#   1. SPCS: the session token at /snowflake/session/token (+ SNOWFLAKE_HOST / SNOWFLAKE_ACCOUNT env)
+#   2. snowsql_connection below -> ~/.snowsql/config (same login as your SnowSQL CLI)
+#   3. connection_name below -> ~/.snowflake/connections.toml
+#   4. SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_AUTHENTICATOR / SNOWFLAKE_PRIVATE_KEY_FILE ... env vars
+
+# Markets processed by prepare.py (basis reference markets are pulled automatically).
+active_markets = ["TTF", "THE"]
+
+[snowflake]
+snowsql_connection = ""       # section in ~/.snowsql/config: "default" = [connections], "x" = [connections.x]
+connection_name = ""          # entry in ~/.snowflake/connections.toml; empty = SPCS token or env vars
+warehouse = ""                # optional overrides (empty = connection default)
+role = ""
+database = ""
+start_date = "2015-01-01"
+
+[snowflake.curves]
+# Long curve view: one row per (trade date, entity, month offset).
+table = "RW_CF_FERA.VW_ML_LONG"
+date_col = "TRADE_DATE"
+entity_col = "ENTITY_ID"
+tenor_col = "MONTH_OFFSET"
+value_col = "VALUE_NATIVE"
+extra_filter = ""             # optional SQL predicate, e.g. "SERIES = 'SETTLE'"
+
+[snowflake.entities]
+# ENTITY_ID -> market name
+1 = "TTF"
+2 = "THE"
+3 = "JKM"
+5 = "POWER_DE_BL"
+7 = "EUA"
+8 = "NORDIC"
+9 = "CSS_DE_BL"
+
+[snowflake.model_scores]
+# Published scores of the live Shape AE, used to seed event candidates (events.py mine).
+# Assumed long layout: one row per (date, entity, model, output id). Column names unconfirmed.
+table = "AN_FERA.MODEL_SCORES"
+date_col = "TRADE_DATE"
+entity_col = "ENTITY_ID"
+model_col = "MODEL_ID"
+output_col = "OUTPUT_ID"
+number_col = "VALUE_NUMBER"
+string_col = "VALUE_STRING"
+model_id = 3
+
+[spcs]
+# Snowpark Container Services job runner (spcs_run.py). Placeholders: fill in before the first run.
+database = "FERA_DB"                      # database / schema holding the objects below
+schema = "SHAPE_AE"
+compute_pool = "SHAPE_AE_GPU_POOL"        # GPU pool, e.g. instance family GPU_NV_S
+image_repository = "SHAPE_AE_IMAGES"      # image repository name (in database.schema)
+image_name = "shape-ae"
+stage = "SHAPE_AE_STAGE"                  # internal stage (SNOWFLAKE_SSE) mounted at /stage in every job
+gpus = 1                                  # nvidia.com/gpu per job (0 = CPU pool)
+job_timeout_minutes = 15                  # an experiment that runs longer is treated as failed
+query_warehouse = ""                      # warehouse for the job's own Snowflake queries (prepare)
+
+[features]
+# "computed": all 14 features computed in-repo from the curves.
+# "snowflake": clean-day values read from the feature store for the columns mapped below;
+#              unmapped features stay computed. Injected days = store value + computed perturbation delta.
+source = "computed"
+
+[features.snowflake]
+table = ""                    # e.g. "AN_FERA.FEATURE_STORE_WIDE"
+date_col = "TRADE_DATE"
+entity_col = "ENTITY_ID"
+format = "wide"               # "wide": one column per feature; "long": name_col / value_col
+name_col = "FEATURE_NAME"
+value_col = "VALUE"
+
+[features.snowflake.columns]
+# repo feature name -> store column (wide) or store feature name (long). Leave out unknown ones.
+# return_z = "RETURN_Z"
+# rv_21d = "RV_21D"
