@@ -51,6 +51,31 @@ The injection works the same way on real curves, so the metric needs no labelled
 - **Feature store** (`[features] source = "snowflake"`): mapped features use store values on clean days. Unmapped features and the PCA factors stay computed, because PCA must be fitted inside the fold. Injected days get the store value plus the computed effect of the perturbation, so the evaluation stays consistent. A parity report (corr and std ratio, computed vs store) is printed and saved per market.
 - **Tests:** `python tests/test_data_sources.py` runs against a fake Snowflake connector, so no account is needed.
 
+**SnowSQL login:** set `snowsql_connection = "<name>"` in `fera.toml` to reuse `[connections.<name>]` from `~/.snowsql/config`. A key-pair passphrase is read from `PRIVATE_KEY_PASSPHRASE`, the same env var SnowSQL uses. Fallback without the Python connector: export with SnowSQL and use the file route.
+
+```bash
+snowsql -c <name> -o output_format=csv -o header=true -o timing=false -o friendly=false \
+  -q "SELECT TRADE_DATE, ENTITY_ID, MONTH_OFFSET, VALUE_NATIVE FROM RW_CF_FERA.VW_ML_LONG
+      WHERE ENTITY_ID IN (1,2) AND MONTH_OFFSET BETWEEN 1 AND 36" > curves.csv
+uv run prepare.py --curves curves.csv      # ENTITY_IDs are mapped to market names via fera.toml
+```
+
+**Roll days:** on the first trading day of a month, yesterday's curve is shifted one tenor (ALIGN). Today's M36 was not quoted yesterday, so it is estimated as M25 + (M36 − M24). Without this, every roll day showed a fake M36 jump in `dshape`, Back-slope Δ and the PCA factors.
+
+## Event catalogue (step 2)
+
+`events.py` builds the labelled catalogue that the evaluation will use:
+
+- `mine` proposes candidates from two independent sources:
+  - **CURVE**, model-free: robust z against the trailing year of the roll-aligned shape change per tenor, the tenor kink, and the spread features;
+  - **SHAPE_AE**: live alert days from `AN_FERA.MODEL_SCORES`.
+
+  It adds 20 random **CONTROL** days per market, writes `events/candidates_<SNAP>.csv` with suggested tenors and features, and leaves the label columns blank.
+- `load` validates your labels (label values, tenor syntax, feature names, dates) and merges them into the git-tracked `events/events.csv`.
+- `stats` summarises the catalogue.
+
+See `events/README.md` for the labelling guide. Tests: `python tests/test_events.py`. Planted events must be found, with the right tenors.
+
 ## Quick start
 
 ```bash
@@ -72,7 +97,8 @@ Have a look at program.md and let's kick off a new experiment! Let's do the setu
 ```
 fera.toml       — data-source config: markets, Snowflake view/columns, entity map, feature store (no secrets)
 data_sources.py — Snowflake pulls, content-hashed snapshots, data-quality checks (do not modify)
-tests/          — data-layer tests (fake Snowflake connector)
+events.py       — event catalogue: mine candidates, load labels (events/events.csv is tracked)
+tests/          — data-layer and event tests (fake Snowflake connector, planted events)
 prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
 train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
 program.md      — agent instructions

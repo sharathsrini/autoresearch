@@ -1,0 +1,3 @@
+candidate_id,market,start,peak,end,source,label,label_tenors,tenor_mask,label_features,label_type,label_notes,labeller,snapshot_id
+TTF_20251201,TTF,2025-12-01,2025-12-01,2025-12-01,CURVE,EVENT,M7-M9,000000111000000000000000000000000000,slope_d;curvature_d,broken_spread,,,SNAP_0027DE600942CD1B
+TTF_20260101,TTF,2026-01-01,2026-01-01,2026-01-01,CURVE,NOT_EVENT,,000000000000000000000000000000000000,,,,,SNAP_0027DE600942CD1B

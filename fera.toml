@@ -1,13 +1,15 @@
 # Data-source configuration for Shape AE autoresearch (read by prepare.py / data_sources.py).
 # No secrets here. Snowflake auth comes from, in order:
 #   1. SPCS: the session token at /snowflake/session/token (+ SNOWFLAKE_HOST / SNOWFLAKE_ACCOUNT env)
-#   2. connection_name below -> ~/.snowflake/connections.toml
-#   3. SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_AUTHENTICATOR / SNOWFLAKE_PRIVATE_KEY_FILE ... env vars
+#   2. snowsql_connection below -> ~/.snowsql/config (same login as your SnowSQL CLI)
+#   3. connection_name below -> ~/.snowflake/connections.toml
+#   4. SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_AUTHENTICATOR / SNOWFLAKE_PRIVATE_KEY_FILE ... env vars
 
 # Markets processed by prepare.py (basis reference markets are pulled automatically).
 active_markets = ["TTF", "THE"]
 
 [snowflake]
+snowsql_connection = ""       # section in ~/.snowsql/config: "default" = [connections], "x" = [connections.x]
 connection_name = ""          # entry in ~/.snowflake/connections.toml; empty = SPCS token or env vars
 warehouse = ""                # optional overrides (empty = connection default)
 role = ""
@@ -32,6 +34,18 @@ extra_filter = ""             # optional SQL predicate, e.g. "SERIES = 'SETTLE'"
 7 = "EUA"
 8 = "NORDIC"
 9 = "CSS_DE_BL"
+
+[snowflake.model_scores]
+# Published scores of the live Shape AE, used to seed event candidates (events.py mine).
+# Assumed long layout: one row per (date, entity, model, output id). Column names unconfirmed.
+table = "AN_FERA.MODEL_SCORES"
+date_col = "TRADE_DATE"
+entity_col = "ENTITY_ID"
+model_col = "MODEL_ID"
+output_col = "OUTPUT_ID"
+number_col = "VALUE_NUMBER"
+string_col = "VALUE_STRING"
+model_id = 3
 
 [features]
 # "computed": all 14 features computed in-repo from the curves.

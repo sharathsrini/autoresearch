@@ -217,6 +217,20 @@ def test_snowflake_flow_with_feature_store():
     k = d.a["test_idx"][:50]
     assert np.allclose(d.a["feat_raw"][k, j], 2.0 * clean["TTF"].a["feat_raw"][k, j] + 1.0)
 
+def test_snowsql_config_mapping():
+    path = os.path.join(os.environ["SHAPE_AE_CACHE"], "snowsql_config")
+    with open(path, "w") as f:
+        f.write('[connections]\naccountname = "acct-default"\nusername = u0\n\n'
+                '[connections.fera]\naccountname = "xy12345.eu-central-1"\nusername = "SHARATH"\n'
+                'authenticator = externalbrowser\nrolename = FERA_RW\nwarehousename = WH_FERA\n'
+                'private_key_path = "~/keys/rsa_key.p8"\nlog_file = ~/x.log\n')
+    p = ds.snowsql_params("fera", path)
+    assert p["account"] == "xy12345.eu-central-1" and p["user"] == "SHARATH"
+    assert p["authenticator"] == "externalbrowser" and p["role"] == "FERA_RW" and p["warehouse"] == "WH_FERA"
+    assert p["private_key_file"].endswith("/keys/rsa_key.p8") and not p["private_key_file"].startswith("~")
+    assert "log_file" not in p
+    assert ds.snowsql_params("default", path)["account"] == "acct-default"
+
 def test_feature_store_requires_mapping():
     cfg = ds.load_config()
     try:

@@ -21,3 +21,6 @@ dev/
 
 # Results file
 results.tsv
+
+# Generated event candidates (labelled catalogue events/events.csv is tracked)
+events/candidates_*.csv

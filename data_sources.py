@@ -64,6 +64,8 @@ def connect(cfg):
         return snowflake.connector.connect(
             host=os.environ["SNOWFLAKE_HOST"], account=os.environ["SNOWFLAKE_ACCOUNT"],
             authenticator="oauth", token=token, **opts)
+    if sf.get("snowsql_connection"):
+        return snowflake.connector.connect(**{**snowsql_params(sf["snowsql_connection"]), **opts})
     if sf.get("connection_name"):
         return snowflake.connector.connect(connection_name=sf["connection_name"], **opts)
     env = {k[len("SNOWFLAKE_"):].lower(): v for k, v in os.environ.items()
@@ -73,6 +75,33 @@ def connect(cfg):
         raise RuntimeError("No Snowflake credentials: set connection_name in fera.toml, "
                            "SNOWFLAKE_ACCOUNT/SNOWFLAKE_USER/... env vars, or run inside SPCS.")
     return snowflake.connector.connect(**{**env, **opts})
+
+SNOWSQL_CONFIG = os.path.join(os.path.expanduser("~"), ".snowsql", "config")
+_SNOWSQL_KEYS = {"accountname": "account", "username": "user", "password": "password",
+                 "authenticator": "authenticator", "rolename": "role", "warehousename": "warehouse",
+                 "dbname": "database", "schemaname": "schema", "private_key_path": "private_key_file",
+                 "host": "host", "port": "port", "region": "region"}
+
+def snowsql_params(name, path=SNOWSQL_CONFIG):
+    """Connector kwargs from a SnowSQL config section: [connections.<name>] ('default' = [connections])."""
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    if not cp.read(os.path.expanduser(path)):
+        raise RuntimeError(f"SnowSQL config not found: {path}")
+    section = "connections" if name == "default" else f"connections.{name}"
+    if section not in cp:
+        raise RuntimeError(f"[{section}] not in {path}; sections: {cp.sections()}")
+    out = {}
+    for k, v in cp[section].items():
+        if k in _SNOWSQL_KEYS:
+            out[_SNOWSQL_KEYS[k]] = v.strip().strip('"').strip("'")
+    if "private_key_file" in out:
+        out["private_key_file"] = os.path.expanduser(out["private_key_file"])
+        if os.environ.get("PRIVATE_KEY_PASSPHRASE"):  # same env var SnowSQL uses
+            out["private_key_file_pwd"] = os.environ["PRIVATE_KEY_PASSPHRASE"]
+    if "account" not in out:
+        raise RuntimeError(f"[{section}] in {path} has no accountname")
+    return out
 
 def _query_df(conn, sql, params):
     cur = conn.cursor()

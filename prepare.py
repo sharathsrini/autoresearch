@@ -181,7 +181,9 @@ def read_curves(path):
     df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
     df.columns = [c.upper() for c in df.columns]
     if "MARKET" not in df.columns and "ENTITY_ID" in df.columns:
-        df = df.rename(columns={"ENTITY_ID": "MARKET"})
+        import data_sources as ds
+        ents = ds.load_config()["snowflake"]["entities"]
+        df["MARKET"] = df["ENTITY_ID"].map(lambda e: ents.get(int(e), str(e)) if pd.notna(e) else e)
     df["TRADE_DATE"] = pd.to_datetime(df["TRADE_DATE"])
     df["MARKET"] = df["MARKET"].astype(str)
     out = {}
@@ -210,13 +212,17 @@ def market_config(mkt, wide):
 
 def aligned_previous(T, dates):
     """Yesterday's curve on today's tenors. On a roll day (new month) yesterday's
-    M(k+1) is today's M(k) (ALIGN mode; M36 is carried flat). NaN after a gap."""
+    M(k+1) is today's M(k) (ALIGN mode). Today's M36 was yesterday's unquoted M37; it is
+    estimated as M25 + (M36 - M24): same calendar month a year earlier plus the annual step,
+    which keeps both the seasonal pattern and the slope. NaN after a gap."""
     dates = pd.DatetimeIndex(dates)
     prev = np.full_like(T, np.nan)
     prev[1:] = T[:-1]
     roll = np.zeros(len(T), bool)
     roll[1:] = dates.month[1:] != dates.month[:-1]
+    last = prev[roll, -1].copy()
     prev[roll, :-1] = prev[roll, 1:]
+    prev[roll, -1] = prev[roll, 23] + (last - prev[roll, 22])  # M25 + (M36 - M24), in yesterday's tenors
     gap = np.zeros(len(T), bool)
     gap[1:] = (dates[1:] - dates[:-1]).days > MAX_GAP_DAYS
     gap[0] = True
