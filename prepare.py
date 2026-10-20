@@ -922,8 +922,14 @@ def export_outputs(market, reconstruct_fn, out_dir=OUTPUT_DIR, split="eval", plo
                              np.where(sc["curve"] / scorer.bar_curve >= sc["feat"] / scorer.bar_feat, "CURVE", "FEATURE"))
     df["SEVERITY"] = pd.cut(df["BAR_MULTIPLE"], [-np.inf, 1, 1.5, 2, np.inf],
                             labels=["NORMAL", "MEDIUM", "HIGH", "CRITICAL"], right=False).astype(str)
-    df["DRIVER_REGION"] = np.array(list(REGIONS))[sc["driver_region"]]
-    df["DRIVER_TENORS"] = [tenors_to_str(driver_tenors(row)) for row in sc["rn"]]
+    drivers = np.array([driver_tenors(row) for row in sc["rn"]])
+    weight = np.abs(sc["rn"]) * drivers
+    region_names = np.array(list(REGIONS))
+    # region where the driver tenors are (|evidence|-weighted), so text and tenors always agree
+    df["DRIVER_REGION"] = region_names[np.stack([weight[:, sl].sum(1) for sl in REGIONS.values()], 1).argmax(1)]
+    df["REGION_SCORE_MAX"] = region_names[sc["driver_region"]]  # length-normalised region score (metric diagnostic)
+    df["DRIVER_TENORS"] = [tenors_to_str(m) for m in drivers]
+    df["DRIVER_BREADTH"] = (np.abs(sc["rn"]) >= 1.0).mean(1)  # share of tenors off by >= 1 calibration RMS
     top = np.abs(sc["rn"]).argmax(1)
     df["DRIVER_TENOR"] = [f"M{k + 1}" for k in top]
     df["DRIVER_TENOR_GAP_NATIVE"] = gap[np.arange(len(top)), top]  # observed - reconstructed, price units
@@ -933,12 +939,15 @@ def export_outputs(market, reconstruct_fn, out_dir=OUTPUT_DIR, split="eval", plo
     df["DRIVER_FEATURE_RESID"] = sc["fn"][np.arange(len(order)), order[:, 0]]
     df["EXPLANATION"] = [
         "" if not fl else
-        (f"curve shape: {ten or tt} ({reg}), {tt} {g:+.2f} vs rebuilt normal; feature {FEATURE_LABELS[f1]} {fr:+.1f}"
+        (f"curve shape: broad ({br:.0%} of tenors off), largest {tt} {g:+.2f} vs rebuilt normal; "
+         f"feature {FEATURE_LABELS[f1]} {fr:+.1f}" if trg == "CURVE" and br >= 0.5 else
+         f"curve shape: {ten or tt} ({reg}), {tt} {g:+.2f} vs rebuilt normal; feature {FEATURE_LABELS[f1]} {fr:+.1f}"
          if trg == "CURVE" else
          f"feature: {FEATURE_LABELS[f1]} {fr:+.1f} vs rebuilt normal; largest curve gap {tt} {g:+.2f}")
-        for fl, trg, ten, reg, tt, g, f1, fr in zip(sc["flag"], df["TRIGGER"], df["DRIVER_TENORS"], df["DRIVER_REGION"],
-                                                     df["DRIVER_TENOR"], df["DRIVER_TENOR_GAP_NATIVE"],
-                                                     df["DRIVER_FEATURE"], df["DRIVER_FEATURE_RESID"])]
+        for fl, trg, ten, reg, tt, g, f1, fr, br in zip(sc["flag"], df["TRIGGER"], df["DRIVER_TENORS"],
+                                                         df["DRIVER_REGION"], df["DRIVER_TENOR"],
+                                                         df["DRIVER_TENOR_GAP_NATIVE"], df["DRIVER_FEATURE"],
+                                                         df["DRIVER_FEATURE_RESID"], df["DRIVER_BREADTH"])]
     cal_out = scorer.fn(data.batch("calibration"))
     if z is not None and len(cal_out) > 3 and cal_out[3] is not None:
         zc = np.asarray(cal_out[3], np.float64)

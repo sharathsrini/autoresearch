@@ -150,6 +150,14 @@ def test_export_outputs_explain_flagged_days():
     for f in ["TTF_scores.csv", "TTF_curve_recon.csv", "TTF_feature_recon.csv"]:
         assert os.path.exists(os.path.join(out, f))
     assert {"A_MAHAL", "TRANSITION_SCORE", "DRIVER_TENOR_GAP_NATIVE"} <= set(df.columns)
+    # the named region always contains driver tenors
+    for _, row in flagged.iterrows():
+        if row["DRIVER_TENORS"]:
+            sl = P.REGIONS[row["DRIVER_REGION"]]
+            tenors = [int(x) for part in row["DRIVER_TENORS"].split(",")
+                      for x in range(int(part.split("-")[0][1:]), int(part.split("-")[-1][1:]) + 1)]
+            assert any(sl.start < t <= sl.stop for t in tenors), (row["DRIVER_TENORS"], row["DRIVER_REGION"])
+    assert df["DRIVER_BREADTH"].between(0, 1).all()
 
 if __name__ == "__main__":
     fails = 0
