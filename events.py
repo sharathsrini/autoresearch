@@ -55,19 +55,7 @@ LABEL_COLUMNS = ["label", "label_tenors", "label_features", "label_type", "label
 # Tenor-set helpers ("M1-M3,M13" <-> boolean mask)
 # ---------------------------------------------------------------------------
 
-def tenors_to_str(mask):
-    idx = np.where(mask)[0] + 1
-    if len(idx) == 0:
-        return ""
-    parts, start, prev = [], idx[0], idx[0]
-    for k in list(idx[1:]) + [None]:
-        if k is not None and k == prev + 1:
-            prev = k
-            continue
-        parts.append(f"M{start}" if start == prev else f"M{start}-M{prev}")
-        if k is not None:
-            start = prev = k
-    return ",".join(parts)
+tenors_to_str = prepare.tenors_to_str
 
 _TENOR_TOKEN = re.compile(r"^M(\d{1,2})(?:-M(\d{1,2}))?$")
 

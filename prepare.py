@@ -22,6 +22,7 @@ Data is stored in ~/.cache/autoresearch/shape_ae/.
 """
 
 import os
+import re
 import json
 import argparse
 
@@ -40,7 +41,6 @@ Z_WINDOW, Z_MIN = 252, 63  # trailing window for return z / basis level z
 MAX_GAP_DAYS = 5         # a day change across a larger gap is not computed
 FEATURE_CLIP = 12.0      # scaled features are clipped to +-FEATURE_CLIP
 EV_FLOOR = 0.80          # a market scores 0 if clean-test shape EV is below this
-BAR_QUANTILE = 0.99      # anomaly bar = this quantile of calibration errors
 INJECT_PER_TYPE = 60     # injected anomaly copies per anomaly type per market
 INJECT_SEED = 1234
 
@@ -297,7 +297,7 @@ def _pca(dshape_fit):
     return mu, comps * flip
 
 def _inject(T, kind, j_rng, sigma, months_row):
-    """Return a perturbed copy of one transformed curve row and the anomaly params."""
+    """Return a perturbed copy of one transformed curve row."""
     t = T.copy()
     a = j_rng.uniform(1.5, 6.0) * j_rng.choice([-1.0, 1.0])
     sbar = sigma.mean()
@@ -366,7 +366,9 @@ def process_market(mkt, wide, ref_wide, cfg, store=None):
         fit_idx = np.where(is_fit & valid)[0]
     es_idx = np.where(is_es & valid)[0]
     cal_idx = np.where(is_cal & valid & ~stressed)[0]
+    cal_all_idx = np.where(is_cal & valid)[0]
     test_idx = np.where(is_test & valid)[0]
+    eval_idx = np.where(valid & (dates >= EARLY_STOP[0]))[0]
     if min(len(fit_idx), len(es_idx), len(cal_idx), len(test_idx)) == 0:
         print(f"  {mkt}: skipped (empty split: fit={len(fit_idx)} es={len(es_idx)} cal={len(cal_idx)} test={len(test_idx)})")
         return None
@@ -399,6 +401,7 @@ def process_market(mkt, wide, ref_wide, cfg, store=None):
         dshape=scale("dshape", np.nan_to_num(raw["dshape"])),
         feat=scale("feat", np.nan_to_num(feat_raw)), feat_raw=feat_raw,
         fit_idx=fit_idx, es_idx=es_idx, cal_idx=cal_idx, test_idx=test_idx,
+        cal_all_idx=cal_all_idx, eval_idx=eval_idx, valid=valid,
         stressed=stressed,
     )
 
@@ -408,7 +411,8 @@ def process_market(mkt, wide, ref_wide, cfg, store=None):
     sigma = np.nanstd(raw["dshape"][fit_idx], axis=0)
     months_all = tenor_months(dates)
     cand = test_idx[test_idx >= Z_WINDOW + 30]
-    inj = {key: [] for key in ["curve", "shape", "dshape", "feat", "level", "months", "price", "T", "type", "row"]}
+    inj = {key: [] for key in ["curve", "shape", "dshape", "feat", "level", "months", "price", "T", "type", "row",
+                               "truth"]}
     for ti, akind in enumerate(ANOMALY_TYPES):
         for _ in range(INJECT_PER_TYPE if len(cand) else 0):
             r = int(rng.choice(cand))
@@ -420,7 +424,13 @@ def process_market(mkt, wide, ref_wide, cfg, store=None):
             f = assemble(rs["scalar"][-1:] + store_offset, rs["shape"][-1:], rs["dshape"][-1:])
             inj["curve"].append(scale("curve", Ts[-1:])[0])
             inj["shape"].append(scale("shape", rs["shape"][-1:])[0])
-            inj["dshape"].append(scale("dshape", np.nan_to_num(rs["dshape"][-1:]))[0])
+            d_inj = scale("dshape", np.nan_to_num(rs["dshape"][-1:]))[0]
+            inj["dshape"].append(d_inj)
+            # True tenors = where the anomaly moved the (level-free, robust-scaled) day change the
+            # model sees by at least half its largest move. For a broken spread that is the shorter
+            # side of the break; for a front twist both legs of the twist.
+            moved = np.abs(d_inj - arrays["dshape"][r])
+            inj["truth"].append(moved >= 0.5 * moved.max())
             inj["feat"].append(scale("feat", np.nan_to_num(f))[0])
             inj["level"].append(Ts[-1].mean())
             inj["months"].append(dates[r].month)
@@ -573,8 +583,12 @@ class MarketData:
 
     def indices(self, split):
         return {"fit": self.a["fit_idx"], "early_stop": self.a["es_idx"],
-                "calibration": self.a["cal_idx"], "test": self.a["test_idx"],
+                "calibration": self.a["cal_idx"], "calibration_all": self.a["cal_all_idx"],
+                "test": self.a["test_idx"], "eval": self.a["eval_idx"],
                 "all": np.arange(len(self.a["T"]))}[split]
+
+    def dates(self, split):
+        return pd.DatetimeIndex(self.a["dates"][self.indices(split)])
 
     def batch(self, split):
         if split == "injected":
@@ -608,6 +622,35 @@ def load_market(market):
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
+#
+# The model rebuilds three things: the level-free shape (state), the roll-aligned day change of the
+# shape (dshape: sudden moves) and the 14 features. Per-tenor evidence combines both curve targets:
+#   e_k = sqrt((r_shape_k^2 + r_dshape_k^2) / 2), each residual divided by its calibration RMS.
+# Explanation is part of the metric. A flagged day is explained by the model's residuals:
+#   - tenor residuals and feature residuals f_j are divided by their calibration RMS, so a
+#     tenor or feature the model always rebuilds poorly cannot dominate the driver
+#   - region scores are normalised by their own calibration quantile, so short regions
+#     (R1 = 3 tenors) are not favoured over long ones (R4 = 24 tenors)
+# Bars are set so that ALERT_TARGET of all calibration days alert (the desk's 5-10% band).
+#
+# Per market:
+#   injected:  S_inj = recall x (0.7 tenor_acc + 0.3 feature_acc)      on injected anomalies
+#   events:    S_ev  = recall x (0.7 tenor_acc + 0.3 feature_acc)      on labelled EVENTs (dev half)
+#   blend:     S = (1 - w) S_inj + w S_ev,   w = n_dev_events / (n_dev_events + EVENT_PRIOR)
+#   gates:     S = 0 if clean-test shape EV < EV_FLOOR; S x alert_factor, where the alert rate is
+#              measured on all out-of-calibration days (early-stop + test): factor 1 inside
+#              ALERT_BAND, falling linearly to 0 at 0% and at ALERT_ZERO
+# val_score = mean of S over markets. Higher is better, max 1.
+
+ALERT_TARGET = 0.075          # share of calibration days that alert
+ALERT_BAND = (0.05, 0.10)     # desk's acceptable alert rate on out-of-calibration days
+ALERT_ZERO = 0.20             # alert factor reaches 0 here (and at 0%)
+W_TENOR, W_FEATURE = 0.7, 0.3 # weights of tenor vs feature attribution in the explanation score
+EVENT_PRIOR = 20              # events weight w = n / (n + EVENT_PRIOR)
+FEATURE_TRUTH_MIN = 0.5       # injected days: a feature counts as moved if |delta| / its scale >= this
+REGION_QUANTILE = 0.90        # region normaliser = this quantile of calibration region RMS
+EVENTS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events", "events.csv")
+EVENT_HOLDOUT_ENV = "SHAPE_AE_EVENT_HOLDOUT"  # set to 1 (human only) to also score the held-out half
 
 def _rms(x):
     return np.sqrt(np.mean(np.square(x), axis=1))
@@ -619,132 +662,303 @@ def average_precision(scores, labels):
     prec = tp / np.arange(1, len(l) + 1)
     return float((prec * l).sum() / max(l.sum(), 1))
 
-def roc_auc(scores, labels):
-    ranks = pd.Series(scores).rank().to_numpy()
-    npos, nneg = labels.sum(), (1 - labels).sum()
-    return float((ranks[labels == 1].sum() - npos * (npos + 1) / 2) / max(npos * nneg, 1))
+def tenors_to_str(mask):
+    """Boolean tenor mask -> 'M1-M3,M13'."""
+    idx = np.where(mask)[0] + 1
+    if len(idx) == 0:
+        return ""
+    parts, start, prev = [], idx[0], idx[0]
+    for k in list(idx[1:]) + [None]:
+        if k is not None and k == prev + 1:
+            prev = k
+            continue
+        parts.append(f"M{start}" if start == prev else f"M{start}-M{prev}")
+        if k is not None:
+            start = prev = k
+    return ",".join(parts)
 
-def _errors(batch, out):
-    shape_hat, feat_hat = np.asarray(out[0], np.float64), np.asarray(out[1], np.float64)
-    return _rms(batch["shape"] - shape_hat), _rms(batch["feat"] - feat_hat), shape_hat, feat_hat
+def _residuals(batch, out):
+    """out = (shape_hat, dshape_hat, feat_hat[, z]) -> residuals of the three targets."""
+    return (batch["shape"].astype(np.float64) - np.asarray(out[0], np.float64),
+            batch["dshape"].astype(np.float64) - np.asarray(out[1], np.float64),
+            batch["feat"].astype(np.float64) - np.asarray(out[2], np.float64))
 
-def evaluate_market(data, reconstruct_fn):
-    """reconstruct_fn(batch) -> (shape_hat (N,36), feat_hat (N,14)[, z (N,L)]) in scaled units."""
-    cal, test, inj = data.batch("calibration"), data.batch("test"), data.batch("injected")
-    c_cal, f_cal, _, _ = _errors(cal, reconstruct_fn(cal))
-    c_test, f_test, shape_hat, _ = _errors(test, reconstruct_fn(test))
-    c_inj, f_inj, _, _ = _errors(inj, reconstruct_fn(inj))
+def alert_factor(rate):
+    lo, hi = ALERT_BAND
+    if rate < lo:
+        return rate / lo
+    if rate > hi:
+        return max(0.0, (ALERT_ZERO - rate) / (ALERT_ZERO - hi))
+    return 1.0
 
-    bar_c = max(np.quantile(c_cal, BAR_QUANTILE), 1e-8)
-    bar_f = max(np.quantile(f_cal, BAR_QUANTILE), 1e-8)
-    score = lambda c, f: np.maximum(c / bar_c, f / bar_f)
-    s_test, s_inj = score(c_test, f_test), score(c_inj, f_inj)
-    scores = np.concatenate([s_test, s_inj])
-    labels = np.concatenate([np.zeros(len(s_test)), np.ones(len(s_inj))])
+class Scorer:
+    """Frozen per-market scoring built from the model's calibration reconstructions."""
 
+    def __init__(self, data, reconstruct_fn):
+        self.data, self.fn = data, reconstruct_fn
+        rs, rd, f = _residuals(data.batch("calibration"), reconstruct_fn(data.batch("calibration")))
+        self.shape_scale = np.maximum(np.sqrt(np.mean(rs ** 2, 0)), 1e-6)
+        self.dshape_scale = np.maximum(np.sqrt(np.mean(rd ** 2, 0)), 1e-6)
+        self.feat_scale = np.maximum(np.sqrt(np.mean(f ** 2, 0)), 1e-6)
+        rn = self._tenor_evidence(rs, rd)
+        self.region_scale = {k: max(np.quantile(_rms(rn[:, sl]), REGION_QUANTILE), 1e-6)
+                             for k, sl in REGIONS.items()}
+        rsa, rda, fa = _residuals(data.batch("calibration_all"), reconstruct_fn(data.batch("calibration_all")))
+        c, fe = _rms(self._tenor_evidence(rsa, rda)), _rms(fa / self.feat_scale)
+        lo, hi = 0.5, 1.0
+        for _ in range(50):  # same quantile q for both bars, chosen so that ALERT_TARGET of days alert
+            q = (lo + hi) / 2
+            bc, bf = max(np.quantile(c, q), 1e-9), max(np.quantile(fe, q), 1e-9)
+            rate = np.mean(np.maximum(c / bc, fe / bf) >= 1.0)
+            lo, hi = (q, hi) if rate > ALERT_TARGET else (lo, q)
+        self.bar_curve, self.bar_feat, self.bar_quantile = bc, bf, q
+
+    def _tenor_evidence(self, rs, rd):
+        """Signed per-tenor evidence: magnitude combines shape and day-change residuals, sign of the larger."""
+        a, b = rs / self.shape_scale, rd / self.dshape_scale
+        return np.sqrt((a ** 2 + b ** 2) / 2) * np.where(np.abs(a) >= np.abs(b), np.sign(a), np.sign(b))
+
+    def score(self, batch, out=None):
+        out = self.fn(batch) if out is None else out
+        r, rd, f = _residuals(batch, out)
+        rn, fn = self._tenor_evidence(r, rd), f / self.feat_scale
+        curve, feat = _rms(rn), _rms(fn)
+        ratio = np.maximum(curve / self.bar_curve, feat / self.bar_feat)
+        regions = np.stack([_rms(rn[:, sl]) / self.region_scale[k] for k, sl in REGIONS.items()], 1)
+        return dict(out=out, r=r, rd=rd, f=f, rn=rn, fn=fn, curve=curve, feat=feat, ratio=ratio, flag=ratio >= 1.0,
+                    regions=regions, driver_region=regions.argmax(1), driver_feature=np.abs(fn).argmax(1))
+
+def tenor_overlap(rn_row, truth):
+    """Share of the k true tenors found among the k largest normalised residuals."""
+    k = int(truth.sum())
+    if k == 0:
+        return np.nan
+    top = np.argsort(-np.abs(rn_row))[:k]
+    return float(truth[top].sum() / k)
+
+def driver_tenors(rn_row):
+    """Tenors a trader is pointed to: |normalised residual| >= max(2, half the largest)."""
+    a = np.abs(rn_row)
+    return a >= max(2.0, 0.5 * a.max())
+
+def _explain_score(tenor_acc, feat_acc):
+    t = np.nanmean(tenor_acc) if len(tenor_acc) and np.isfinite(tenor_acc).any() else 0.0
+    f = np.nanmean(feat_acc) if len(feat_acc) and np.isfinite(feat_acc).any() else t
+    return W_TENOR * t + W_FEATURE * f, t, f
+
+def load_events(market, holdout=False):
+    """Labelled EVENT / NOT_EVENT rows of a market; dev or held-out half (stable hash split)."""
+    import hashlib
+    if not os.path.exists(EVENTS_CSV):
+        return pd.DataFrame()
+    ev = pd.read_csv(EVENTS_CSV, dtype=str).fillna("")
+    ev = ev[(ev["market"] == market) & ev["label"].isin(["EVENT", "NOT_EVENT"])].copy()
+    if ev.empty:
+        return ev
+    half = ev["candidate_id"].map(lambda c: int(hashlib.sha1(c.encode()).hexdigest(), 16) % 2 == 1)
+    ev = ev[half == holdout]
+    for c in ("start", "peak", "end"):
+        ev[c] = pd.to_datetime(ev[c])
+    return ev
+
+def evaluate_events(data, scorer, holdout=False):
+    ev = load_events(data.market, holdout)
+    res = dict(n_events=0, n_not_events=0, recall=np.nan, tenor_acc=np.nan, feature_acc=np.nan,
+               not_event_flag_rate=np.nan, score=0.0)
+    if ev.empty:
+        return res
+    dates = data.dates("eval")
+    sc = scorer.score(data.batch("eval"))
+    feats = {f: i for i, f in enumerate(FEATURES)}
+    detected, t_acc, f_acc, ne_flag = [], [], [], []
+    for _, e in ev.iterrows():
+        rows = np.where((dates >= e["start"]) & (dates <= e["end"]))[0]
+        if len(rows) == 0:
+            continue  # outside the evaluation window (e.g. in the training years)
+        if e["label"] == "NOT_EVENT":
+            ne_flag.append(bool(sc["flag"][rows].any()))
+            continue
+        hit = sc["flag"][rows]
+        detected.append(bool(hit.any()))
+        if hit.any():
+            i = rows[hit][np.argmax(sc["ratio"][rows][hit])]
+            truth = np.array([c == "1" for c in e["tenor_mask"]])
+            t_acc.append(tenor_overlap(sc["rn"][i], truth))
+            labelled = [feats[x] for x in re.split(r"[;,\s]+", e["label_features"]) if x in feats]
+            f_acc.append(float(sc["driver_feature"][i] in labelled) if labelled else np.nan)
+    res.update(n_events=len(detected), n_not_events=len(ne_flag))
+    if detected:
+        recall = float(np.mean(detected))
+        expl, t, f = _explain_score(np.array(t_acc), np.array(f_acc))
+        res.update(recall=recall, tenor_acc=t, feature_acc=f, score=recall * expl)
+    if ne_flag:
+        res["not_event_flag_rate"] = float(np.mean(ne_flag))
+    return res
+
+def evaluate_market(data, reconstruct_fn, holdout=None):
+    """reconstruct_fn(batch) -> (shape_hat (N,36), dshape_hat (N,36), feat_hat (N,14)[, z (N,L)]), scaled units."""
+    if holdout is None:
+        holdout = os.environ.get(EVENT_HOLDOUT_ENV) == "1"
+    scorer = Scorer(data, reconstruct_fn)
+    test, inj = data.batch("test"), data.batch("injected")
+    st, si = scorer.score(test), scorer.score(inj)
+    sesp = scorer.score(data.batch("early_stop"))
+
+    # Reconstruction quality on clean test days (shape EV, price error)
     y = test["shape"].astype(np.float64)
+    shape_hat = np.asarray(st["out"][0], np.float64)
     ev = 1.0 - np.sum((y - shape_hat) ** 2) / np.sum((y - y.mean(0)) ** 2)
     p_true = data.price("test")
     p_hat = data.shape_to_price(shape_hat, data.level("test"))
     price_mape = float(np.median(np.abs(p_hat - p_true) / np.maximum(np.abs(p_true).mean(1, keepdims=True), 1e-8)))
-    ap = average_precision(scores, labels)
-    per_type = {}
+    alert_rate = float(np.concatenate([sesp["flag"], st["flag"]]).mean())  # out-of-calibration days
+    yd = test["dshape"].astype(np.float64)
+    ev_dshape = 1.0 - np.sum((yd - np.asarray(st["out"][1], np.float64)) ** 2) / np.sum((yd - yd.mean(0)) ** 2)
+
+    # Injected anomalies: detection and attribution
+    truth = data.a["inj_truth"].astype(bool)
     types = data.a["inj_type"]
+    dfeat = (inj["feat"] - data.a["feat"][data.a["inj_row"]]) / scorer.feat_scale
+    flag = si["flag"]
+    t_acc = np.array([tenor_overlap(si["rn"][i], truth[i]) for i in range(len(flag))])
+    f_acc = np.full(len(flag), np.nan)
+    for i in range(len(flag)):
+        moved = np.argsort(-np.abs(dfeat[i]))[:2]
+        moved = moved[np.abs(dfeat[i][moved]) >= FEATURE_TRUTH_MIN]
+        if len(moved):
+            f_acc[i] = float(si["driver_feature"][i] in moved)
+    recall = float(flag.mean())
+    expl, t_mean, f_mean = _explain_score(t_acc[flag], f_acc[flag])
+    s_inj = recall * expl
+    region_of_truth = np.stack([truth[:, sl].mean(1) for sl in REGIONS.values()], 1).argmax(1)
+    region_acc = float((si["driver_region"][flag] == region_of_truth[flag]).mean()) if flag.any() else 0.0
+    by_type = {}
     for ti, name in enumerate(ANOMALY_TYPES):
         m = types == ti
         if m.any():
-            per_type[name] = float((s_inj[m] >= 1.0).mean())
-    return dict(
-        score=ap if ev >= EV_FLOOR else 0.0, auprc=ap, auroc=roc_auc(scores, labels),
-        recon_ev=float(ev), far=float((s_test >= 1.0).mean()), recall=float((s_inj >= 1.0).mean()),
-        price_mape=price_mape, curve_bar=float(bar_c), feat_bar=float(bar_f), recall_by_type=per_type,
+            fm = m & flag
+            by_type[name] = dict(recall=round(float(flag[m].mean()), 3),
+                                 tenor_acc=round(float(np.nanmean(t_acc[fm])), 3) if fm.any() else None)
+
+    # Region bias diagnostic: driver-region shares on flagged clean test days
+    shares = np.bincount(st["driver_region"][st["flag"]], minlength=len(REGIONS)) / max(st["flag"].sum(), 1)
+
+    # Labelled events
+    ev_dev = evaluate_events(data, scorer, holdout=False)
+    w = ev_dev["n_events"] / (ev_dev["n_events"] + EVENT_PRIOR)
+    blended = (1 - w) * s_inj + w * ev_dev["score"]
+    a_factor = alert_factor(alert_rate)
+    gates = dict(ev_floor=bool(ev >= EV_FLOOR), alert_factor=round(a_factor, 3))
+    scores = np.concatenate([st["ratio"], si["ratio"]])
+    labels = np.concatenate([np.zeros(len(st["ratio"])), np.ones(len(si["ratio"]))])
+    res = dict(
+        score=float(blended * a_factor if gates["ev_floor"] else 0.0), gates=gates,
+        inj_score=float(s_inj), recall=recall, tenor_acc=float(t_mean), feature_acc=float(f_mean),
+        region_acc=region_acc, recall_by_type=by_type,
+        events=ev_dev, event_weight=float(w),
+        recon_ev=float(ev), dshape_ev=float(ev_dshape), price_mape=price_mape, alert_rate=alert_rate,
+        auprc=average_precision(scores, labels),
+        region_share={k: round(float(v), 3) for k, v in zip(REGIONS, shares)},
+        bar_quantile=float(scorer.bar_quantile),
     )
+    if holdout:
+        res["events_holdout"] = evaluate_events(data, scorer, holdout=True)
+    return res
 
 def evaluate(reconstruct_fns):
-    """reconstruct_fns: {market: fn}. Returns (val_score, per-market results).
-
-    val_score = mean over markets of AUPRC (clean test days vs injected shape anomalies),
-    where the anomaly score is max(curve RMS / bar, feature RMS / bar) with bars = q99 of
-    calibration errors; a market whose clean-test shape EV < EV_FLOOR scores 0. Higher is better.
-    """
+    """reconstruct_fns: {market: fn}. Returns (val_score, per-market results). See the header above."""
     results = {m: evaluate_market(load_market(m), fn) for m, fn in reconstruct_fns.items()}
     return float(np.mean([r["score"] for r in results.values()])), results
 
 # ---------------------------------------------------------------------------
-# Outputs: price-curve + feature reconstruction per day, Shape AE scores, plots
+# Outputs: price-curve + feature reconstruction per day, explanation, Shape AE scores, plots
 # ---------------------------------------------------------------------------
 
 def _mahal(z, mu, cov_inv):
     d = z - mu
     return np.sqrt(np.maximum(np.einsum("ni,ij,nj->n", d, cov_inv, d), 0))
 
-def export_outputs(market, reconstruct_fn, out_dir=OUTPUT_DIR, split="test", plot=True):
-    """Write per-day reconstruction and scores for `split` to out_dir/<market>_*.csv (+ a plot)."""
+def export_outputs(market, reconstruct_fn, out_dir=OUTPUT_DIR, split="eval", plot=True):
+    """Write per-day scores, explanation and reconstructions for `split` to out_dir/<market>_*.csv."""
     os.makedirs(out_dir, exist_ok=True)
     data = load_market(market)
+    scorer = Scorer(data, reconstruct_fn)
     b = data.batch(split)
-    out = reconstruct_fn(b)
-    shape_hat, feat_hat = np.asarray(out[0], np.float64), np.asarray(out[1], np.float64)
-    z = np.asarray(out[2], np.float64) if len(out) > 2 and out[2] is not None else None
-    idx = data.indices(split)
-    dates = pd.DatetimeIndex(data.a["dates"][idx])
-
-    res = b["shape"] - shape_hat
-    fres = b["feat"] - feat_hat
-    cal = data.batch("calibration")
-    cal_out = reconstruct_fn(cal)
-    c_cal, f_cal, _, _ = _errors(cal, cal_out)
-    bar_c, bar_f = np.quantile(c_cal, BAR_QUANTILE), np.quantile(f_cal, BAR_QUANTILE)
+    sc = scorer.score(b)
+    out = sc["out"]
+    shape_hat, feat_hat = np.asarray(out[0], np.float64), np.asarray(out[2], np.float64)
+    z = np.asarray(out[3], np.float64) if len(out) > 3 and out[3] is not None else None
+    dates = data.dates(split)
+    p_true = data.price(split)
+    p_hat = data.shape_to_price(shape_hat, data.level(split))
+    gap = p_true - p_hat
 
     df = pd.DataFrame(index=dates)
     df.index.name = "TRADE_DATE"
-    df["A_GLOBAL"] = _rms(res)
-    for r, sl in REGIONS.items():
-        df["A_" + r] = _rms(res[:, sl])
-    kink = np.abs(res[:, 1:-1] - (res[:, :-2] + res[:, 2:]) / 2)
+    df["A_GLOBAL"] = _rms(sc["r"])                      # raw RMS shape residual (scaled units), as in v3.1
+    df["A_CURVE"] = sc["curve"]                         # normalised curve error (drives the decision)
+    df["A_FEAT"] = sc["feat"]                           # normalised feature error
+    for k, (name, _) in enumerate(REGIONS.items()):
+        df["A_" + name] = sc["regions"][:, k]           # region score / its calibration q90
+    kink = np.abs(sc["r"][:, 1:-1] - (sc["r"][:, :-2] + sc["r"][:, 2:]) / 2)
     df["A_BUTTERFLY_MAX"] = kink.max(1)
-    df["A_FEAT"] = _rms(fres)
-    df["LEVEL_BAR"], df["FEAT_BAR"] = bar_c, bar_f
-    df["BAR_MULTIPLE"] = np.maximum(df["A_GLOBAL"] / bar_c, df["A_FEAT"] / bar_f)
-    df["DECISION"] = (df["BAR_MULTIPLE"] >= 1.0).astype(int)
+    df["CURVE_BAR"], df["FEAT_BAR"] = scorer.bar_curve, scorer.bar_feat
+    df["BAR_MULTIPLE"] = sc["ratio"]
+    df["DECISION"] = sc["flag"].astype(int)
+    df["TRIGGER"] = np.where(~sc["flag"], "NONE",
+                             np.where(sc["curve"] / scorer.bar_curve >= sc["feat"] / scorer.bar_feat, "CURVE", "FEATURE"))
     df["SEVERITY"] = pd.cut(df["BAR_MULTIPLE"], [-np.inf, 1, 1.5, 2, np.inf],
                             labels=["NORMAL", "MEDIUM", "HIGH", "CRITICAL"], right=False).astype(str)
-    region_rms = df[["A_" + r for r in REGIONS]].to_numpy()
-    df["SEVERITY_DRIVER_REGION"] = np.array(list(REGIONS))[region_rms.argmax(1)]
-    df["SEVERITY_DRIVER_FEATURE"] = np.array(FEATURES)[np.abs(fres).argmax(1)]
-    if z is not None and len(cal_out) > 2 and cal_out[2] is not None:
-        zc = np.asarray(cal_out[2], np.float64)
+    df["DRIVER_REGION"] = np.array(list(REGIONS))[sc["driver_region"]]
+    df["DRIVER_TENORS"] = [tenors_to_str(driver_tenors(row)) for row in sc["rn"]]
+    top = np.abs(sc["rn"]).argmax(1)
+    df["DRIVER_TENOR"] = [f"M{k + 1}" for k in top]
+    df["DRIVER_TENOR_GAP_NATIVE"] = gap[np.arange(len(top)), top]  # observed - reconstructed, price units
+    order = np.argsort(-np.abs(sc["fn"]), axis=1)
+    df["DRIVER_FEATURE"] = np.array(FEATURES)[order[:, 0]]
+    df["DRIVER_FEATURE_2"] = np.array(FEATURES)[order[:, 1]]
+    df["DRIVER_FEATURE_RESID"] = sc["fn"][np.arange(len(order)), order[:, 0]]
+    df["EXPLANATION"] = [
+        "" if not fl else
+        (f"curve shape: {ten or tt} ({reg}), {tt} {g:+.2f} vs rebuilt normal; feature {FEATURE_LABELS[f1]} {fr:+.1f}"
+         if trg == "CURVE" else
+         f"feature: {FEATURE_LABELS[f1]} {fr:+.1f} vs rebuilt normal; largest curve gap {tt} {g:+.2f}")
+        for fl, trg, ten, reg, tt, g, f1, fr in zip(sc["flag"], df["TRIGGER"], df["DRIVER_TENORS"], df["DRIVER_REGION"],
+                                                     df["DRIVER_TENOR"], df["DRIVER_TENOR_GAP_NATIVE"],
+                                                     df["DRIVER_FEATURE"], df["DRIVER_FEATURE_RESID"])]
+    cal_out = scorer.fn(data.batch("calibration"))
+    if z is not None and len(cal_out) > 3 and cal_out[3] is not None:
+        zc = np.asarray(cal_out[3], np.float64)
         L = zc.shape[1]
-        mu = zc.mean(0)
         cov_inv = np.linalg.pinv(np.cov(zc, rowvar=False).reshape(L, L) + 1e-4 * np.eye(L))
-        df["A_MAHAL"] = _mahal(z, mu, cov_inv)
-        dzc = np.diff(zc, axis=0)
-        dcov_inv = np.linalg.pinv(np.cov(dzc, rowvar=False).reshape(L, L) + 1e-4 * np.eye(L))
-        dz = np.vstack([np.full((1, L), np.nan), np.diff(z, axis=0)])
-        df["TRANSITION_SCORE"] = _mahal(np.nan_to_num(dz), np.zeros(L), dcov_inv)
-        df.loc[df.index[0], "TRANSITION_SCORE"] = np.nan
+        df["A_MAHAL"] = _mahal(z, zc.mean(0), cov_inv)
+        dcov_inv = np.linalg.pinv(np.cov(np.diff(zc, axis=0), rowvar=False).reshape(L, L) + 1e-4 * np.eye(L))
+        dz = np.vstack([np.zeros((1, L)), np.diff(z, axis=0)])
+        ts = _mahal(dz, np.zeros(L), dcov_inv)
+        ts[0] = np.nan
+        ts[1:][(dates[1:] - dates[:-1]).days > MAX_GAP_DAYS] = np.nan
+        df["TRANSITION_SCORE"] = ts
         for i in range(L):
             df[f"Z{i + 1}"] = z[:, i]
     df.to_csv(os.path.join(out_dir, f"{market}_scores.csv"))
 
-    p_true = data.price(split)
-    p_hat = data.shape_to_price(shape_hat, data.level(split))
     tenors = [f"M{i}" for i in range(1, N_TENORS + 1)]
-    long = pd.concat({
+    pd.concat({
         "PRICE": pd.DataFrame(p_true, index=dates, columns=tenors),
         "PRICE_RECON": pd.DataFrame(p_hat, index=dates, columns=tenors),
-        "SHAPE_SCALED_RESIDUAL": pd.DataFrame(res, index=dates, columns=tenors),
-    }, axis=1)
-    long.to_csv(os.path.join(out_dir, f"{market}_curve_recon.csv"))
-    feats = pd.concat({
+        "GAP_NATIVE": pd.DataFrame(gap, index=dates, columns=tenors),
+        "RESID_NORMALISED": pd.DataFrame(sc["rn"], index=dates, columns=tenors),
+    }, axis=1).to_csv(os.path.join(out_dir, f"{market}_curve_recon.csv"))
+    pd.concat({
         "FEATURE": pd.DataFrame(b["feat"], index=dates, columns=FEATURES),
         "FEATURE_RECON": pd.DataFrame(feat_hat, index=dates, columns=FEATURES),
-        "FEATURE_RESIDUAL": pd.DataFrame(fres, index=dates, columns=FEATURES),
-    }, axis=1)
-    feats.to_csv(os.path.join(out_dir, f"{market}_feature_recon.csv"))
+        "RESID_NORMALISED": pd.DataFrame(sc["fn"], index=dates, columns=FEATURES),
+    }, axis=1).to_csv(os.path.join(out_dir, f"{market}_feature_recon.csv"))
 
     if plot:
-        _plot_day(market, dates[-1], p_true[-1], p_hat[-1], res[-1], fres[-1], df.iloc[-1],
+        flagged = np.where(sc["flag"])[0]
+        i = flagged[-1] if len(flagged) else len(dates) - 1  # latest flagged day, else the latest day
+        _plot_day(market, dates[i], p_true[i], p_hat[i], sc["rn"][i], sc["fn"][i], df.iloc[i],
                   os.path.join(out_dir, f"{market}_latest.png"))
     return df
 
@@ -761,18 +975,22 @@ def _plot_day(market, date, p_true, p_hat, res, fres, row, path):
     ax = axes[0]
     ax.plot(x, p_true, "o-", ms=3, label="observed")
     ax.plot(x, p_hat, "s--", ms=3, label="reconstruction (re-anchored at level)")
-    ax.set_title(f"{market} {date.date()}  price curve (A_GLOBAL {row['A_GLOBAL']:.3f}, bar x{row['BAR_MULTIPLE']:.2f})")
+    ax.set_title(f"{market} {date.date()}  bar x{row['BAR_MULTIPLE']:.2f} ({row['SEVERITY']})")
     ax.set_xlabel("tenor M1..M36"); ax.set_ylabel("price (native)"); ax.legend()
     ax = axes[1]
-    ax.bar(x, res, color=["#d9534f" if abs(v) > 1 else "#3b82f6" for v in res])
+    drv = driver_tenors(res)
+    ax.bar(x, res, color=np.where(drv, "#d9534f", "#3b82f6"))
     ax.axhline(0, color="k", lw=0.8)
-    ax.set_title("Curve reconstruction residual per tenor (scaled)"); ax.set_xlabel("tenor")
+    ax.set_title(f"Normalised residual per tenor (red = drivers {row['DRIVER_TENORS'] or '-'})")
+    ax.set_xlabel("tenor")
     ax = axes[2]
     order = np.argsort(np.abs(fres))
     ax.barh([FEATURE_LABELS[FEATURES[i]] for i in order], fres[order], color="#3b82f6")
     ax.axvline(0, color="k", lw=0.8)
-    ax.set_title(f"Feature reconstruction (A_FEAT {row['A_FEAT']:.3f})")
-    ax.set_xlabel("reconstruction residual (normalized feature space)")
+    ax.set_title(f"Feature reconstruction (A_FEAT {row['A_FEAT']:.2f})")
+    ax.set_xlabel("normalised reconstruction residual")
+    if row["EXPLANATION"]:
+        fig.suptitle(row["EXPLANATION"], fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)

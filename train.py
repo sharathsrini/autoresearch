@@ -2,9 +2,11 @@
 Shape AE autoresearch training script. Single file, one model per market.
 
 A multi-channel 1-D conv autoencoder over the 36-tenor forward curve, fused with an
-MLP over the 14 scalar curve features. One latent code z rebuilds both:
+MLP over the 14 scalar curve features. One latent code z rebuilds three targets:
   - the level-free curve shape (-> native price curve, re-anchored at the observed level)
+  - the roll-aligned day change of the shape (dshape: where the curve moved today)
   - the scalar feature vector (Slope Δ, Curvature Δ, RV 21d, PCA factors, ...)
+prepare.py turns the residuals into the decision and its explanation (tenors, feature).
 
 Usage: uv run train.py
 """
@@ -40,7 +42,8 @@ BATCH_SIZE = 128
 GRAD_CLIP = 1.0
 HUBER_DELTA = 1.0
 DENOISE_STD = 0.03      # input noise (denoising AE), targets stay clean
-FEAT_LOSS_WEIGHT = 1.0  # weight of feature reconstruction vs curve reconstruction
+DSHAPE_LOSS_WEIGHT = 1.0  # weight of day-change reconstruction vs shape reconstruction
+FEAT_LOSS_WEIGHT = 1.0    # weight of feature reconstruction vs shape reconstruction
 MAX_EPOCHS = 200
 PATIENCE = 15           # early stop on the early-stop split
 SEED = 1729
@@ -72,7 +75,7 @@ class ShapeAE(nn.Module):
         self.dec_conv = nn.Sequential(
             nn.GELU(),
             nn.Conv1d(h2, hidden, 3, padding=1), nn.GELU(),
-            nn.Conv1d(hidden, 1, 5, padding=2),
+            nn.Conv1d(hidden, 2, 5, padding=2),  # channel 0: shape, channel 1: dshape
         )
         # feature decoder
         self.dec_feat = nn.Sequential(nn.Linear(latent, feat_hidden), nn.GELU(), nn.Linear(feat_hidden, n_features))
@@ -84,13 +87,13 @@ class ShapeAE(nn.Module):
         return self.to_latent(h)
 
     def decode(self, z):
-        h = self.from_latent(z).view(-1, self.h2, N_TENORS)
-        return self.dec_conv(h).squeeze(1), self.dec_feat(z)
+        h = self.dec_conv(self.from_latent(z).view(-1, self.h2, N_TENORS))
+        return h[:, 0], h[:, 1], self.dec_feat(z)
 
     def forward(self, curve, feat):
         z = self.encode(curve, feat)
-        shape_hat, feat_hat = self.decode(z)
-        return shape_hat, feat_hat, z
+        shape_hat, dshape_hat, feat_hat = self.decode(z)
+        return shape_hat, dshape_hat, feat_hat, z
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -98,25 +101,25 @@ class ShapeAE(nn.Module):
 
 def to_tensors(batch, device):
     curve = np.stack([batch[c] for c in CURVE_CHANNELS], axis=1)  # (N, C, 36)
-    return (torch.from_numpy(curve).to(device), torch.from_numpy(batch["feat"]).to(device),
-            torch.from_numpy(batch["shape"]).to(device))
+    t = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(device)
+    return t(curve), t(batch["feat"]), t(batch["shape"]), t(batch["dshape"])
 
-def loss_fn(model, curve, feat, shape, noise=0.0):
+def loss_fn(model, curve, feat, shape, dshape, noise=0.0):
     if noise > 0:
         curve = curve + noise * torch.randn_like(curve)
         feat = feat + noise * torch.randn_like(feat)
-    shape_hat, feat_hat, _ = model(curve, feat)
-    lc = F.huber_loss(shape_hat, shape, delta=HUBER_DELTA)
+    shape_hat, dshape_hat, feat_hat, _ = model(curve, feat)
+    ls = F.huber_loss(shape_hat, shape, delta=HUBER_DELTA)
+    ld = F.huber_loss(dshape_hat, dshape, delta=HUBER_DELTA)
     lf = F.huber_loss(feat_hat, feat, delta=HUBER_DELTA)
-    return lc + FEAT_LOSS_WEIGHT * lf, lc, lf
+    return ls + DSHAPE_LOSS_WEIGHT * ld + FEAT_LOSS_WEIGHT * lf
 
 def make_reconstruct_fn(model, device):
     @torch.no_grad()
     def fn(batch):
         model.eval()
-        curve, feat, _ = to_tensors(batch, device)
-        shape_hat, feat_hat, z = model(curve, feat)
-        return shape_hat.cpu().numpy(), feat_hat.cpu().numpy(), z.cpu().numpy()
+        curve, feat, _, _ = to_tensors(batch, device)
+        return tuple(x.cpu().numpy() for x in model(curve, feat))  # shape, dshape, feat, z
     return fn
 
 # ---------------------------------------------------------------------------
@@ -127,8 +130,9 @@ def train_market(market, budget_s, device):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     data = load_market(market)
-    curve, feat, shape = to_tensors(data.batch("fit"), device)
-    es_curve, es_feat, es_shape = to_tensors(data.batch("early_stop"), device)
+    fit = to_tensors(data.batch("fit"), device)
+    es = to_tensors(data.batch("early_stop"), device)
+    curve = fit[0]
 
     model = ShapeAE(len(CURVE_CHANNELS), N_FEATURES).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -140,7 +144,7 @@ def train_market(market, budget_s, device):
         perm = torch.randperm(n, device=device)
         for i in range(0, n, BATCH_SIZE):
             idx = perm[i:i + BATCH_SIZE]
-            loss, _, _ = loss_fn(model, curve[idx], feat[idx], shape[idx], DENOISE_STD)
+            loss = loss_fn(model, *(x[idx] for x in fit), noise=DENOISE_STD)
             if not torch.isfinite(loss):
                 print("FAIL")
                 exit(1)
@@ -151,7 +155,7 @@ def train_market(market, budget_s, device):
             steps += 1
         model.eval()
         with torch.no_grad():
-            val, vc, vf = loss_fn(model, es_curve, es_feat, es_shape)
+            val = loss_fn(model, *es)
         if val.item() < best:
             best, bad = val.item(), 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -193,15 +197,22 @@ mean = lambda k: float(np.mean([r[k] for r in results.values()]))
 
 print("---")
 for m, r in results.items():
-    print(f"market {m:12s} score={r['score']:.4f} auprc={r['auprc']:.4f} auroc={r['auroc']:.4f} "
-          f"ev={r['recon_ev']:.4f} far={r['far']:.3f} recall={r['recall']:.3f} price_mape={r['price_mape']:.5f}")
+    e = r["events"]
+    print(f"market {m:12s} score={r['score']:.4f} inj={r['inj_score']:.4f} recall={r['recall']:.3f} "
+          f"tenor_acc={r['tenor_acc']:.3f} feature_acc={r['feature_acc']:.3f} alert_rate={r['alert_rate']:.3f} "
+          f"alert_factor={r['gates']['alert_factor']:.2f} ev={r['recon_ev']:.3f} events={e['n_events']} "
+          f"event_recall={e['recall']:.3f} regions={r['region_share']}")
+    print(f"  by type: " + "  ".join(f"{k}={v['recall']:.2f}/{v['tenor_acc'] if v['tenor_acc'] is not None else 0:.2f}"
+                                   for k, v in r["recall_by_type"].items()) + "  (recall/tenor_acc)")
 print(f"val_score:        {val_score:.6f}")
-print(f"mean_auprc:       {mean('auprc'):.6f}")
-print(f"mean_auroc:       {mean('auroc'):.6f}")
-print(f"mean_recon_ev:    {mean('recon_ev'):.6f}")
-print(f"mean_far:         {mean('far'):.6f}")
 print(f"mean_recall:      {mean('recall'):.6f}")
+print(f"mean_tenor_acc:   {mean('tenor_acc'):.6f}")
+print(f"mean_feature_acc: {mean('feature_acc'):.6f}")
+print(f"mean_alert_rate:  {mean('alert_rate'):.6f}")
+print(f"mean_recon_ev:    {mean('recon_ev'):.6f}")
+print(f"mean_auprc:       {mean('auprc'):.6f}")
 print(f"price_mape:       {mean('price_mape'):.6f}")
+print(f"n_dev_events:     {sum(r['events']['n_events'] for r in results.values())}")
 print(f"training_seconds: {training_seconds:.1f}")
 print(f"total_seconds:    {time.time() - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")

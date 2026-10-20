@@ -27,18 +27,24 @@ The baseline model extends the deployed v3.1 architecture (`Conv1d k5 → k3 →
 1. **the curve shape**, which is re-anchored at the observed level to give the **price curve reconstruction** in native units;
 2. **the feature vector**, giving per-feature residuals in normalized feature space.
 
-### Metric
+### Metric (step 3: explain-first)
 
-Each test day gets an anomaly score of `max(curve RMS error / q99 calibration bar, feature RMS error / q99 calibration bar)`. **`val_score`** is the mean over markets of the AUPRC that separates clean test days from copies of test days with an **injected shape anomaly**: a kink, broken spread, front twist, seasonal hump or back-end bend, with features recomputed from the perturbed curve. A market whose clean-test shape EV is below 0.80 scores 0. Higher is better.
+The model rebuilds the curve shape, its day change (`dshape`) and the 14 features. `prepare.py` turns the residuals into a decision and an explanation, normalising every tenor and feature by its calibration residual so no tenor, feature or region is favoured. Bars are set so that 7.5% of calibration days alert, matching the desk's 5–10% target.
 
-The injection works the same way on real curves, so the metric needs no labelled event catalogue.
+Per market, `S = recall × (0.7·tenor accuracy + 0.3·feature accuracy)`:
+- on **injected anomalies**, where the true tenors and features are known;
+- on **labelled events** from `events/events.csv`, blended in with weight `n/(n+20)` as the catalogue grows. Half the events are held out for human-only checks.
 
-### Outputs (each run, `~/.cache/autoresearch/shape_ae/outputs/`)
+Gates: shape EV ≥ 0.80, and an alert factor that drops to 0 when the out-of-calibration alert rate leaves 5–10%.
 
-- `<MKT>_scores.csv`: A_GLOBAL, A_R1..A_R4, A_BUTTERFLY_MAX, A_FEAT, BAR_MULTIPLE, DECISION, SEVERITY, driver region and driver feature, A_MAHAL, TRANSITION_SCORE, and latent Z1..ZL.
-- `<MKT>_curve_recon.csv`: observed vs reconstructed price per tenor, plus the scaled residual.
-- `<MKT>_feature_recon.csv`: observed vs reconstructed features, plus the residuals.
-- `<MKT>_latest.png`: price curve vs reconstruction, residual per tenor, and the feature residual bars for the latest day.
+**`val_score`** is the mean over markets; higher is better. On synthetic data, a linear PCA AE scores about 0.42 and an oracle about 0.6. Copying the input scores 0.
+
+### Outputs (each run, `~/.cache/autoresearch/shape_ae/outputs/`, every day from 2024-02)
+
+- `<MKT>_scores.csv`: DECISION, SEVERITY, TRIGGER, **DRIVER_TENORS** (e.g. `M7-M9`), DRIVER_TENOR with its **gap in price units**, **DRIVER_FEATURE**, DRIVER_REGION, an **EXPLANATION** sentence, A_GLOBAL, regions, A_MAHAL, TRANSITION_SCORE and the latent code.
+- `<MKT>_curve_recon.csv`: observed vs reconstructed price per tenor, gap in price units, normalised residual.
+- `<MKT>_feature_recon.csv`: observed vs reconstructed features, normalised residuals.
+- `<MKT>_latest.png`: the latest flagged day, with driver tenors in red and the feature residual bars.
 
 ## Data (step 1: Snowflake source, snapshots, data quality)
 
@@ -98,7 +104,7 @@ Have a look at program.md and let's kick off a new experiment! Let's do the setu
 fera.toml       — data-source config: markets, Snowflake view/columns, entity map, feature store (no secrets)
 data_sources.py — Snowflake pulls, content-hashed snapshots, data-quality checks (do not modify)
 events.py       — event catalogue: mine candidates, load labels (events/events.csv is tracked)
-tests/          — data-layer and event tests (fake Snowflake connector, planted events)
+tests/          — data, event and metric tests (fake Snowflake connector, planted events, oracle model)
 prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
 train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
