@@ -40,11 +40,23 @@ The injection works the same way on real curves, so the metric needs no labelled
 - `<MKT>_feature_recon.csv`: observed vs reconstructed features, plus the residuals.
 - `<MKT>_latest.png`: price curve vs reconstruction, residual per tenor, and the feature residual bars for the latest day.
 
+## Data (step 1: Snowflake source, snapshots, data quality)
+
+`fera.toml` holds the data-source config: active markets (GAS first, so `TTF`, `THE`), the curve view and its columns, the ENTITY_ID → market map, and the optional feature-store mapping. It contains no secrets.
+
+- **Sources:** `--source snowflake` pulls the long view; `--curves file` reads a parquet/CSV export; the default is synthetic curves. Basis-reference markets are pulled automatically.
+- **Auth, tried in order:** the SPCS session token, then `connection_name` in `~/.snowflake/connections.toml`, then `SNOWFLAKE_*` env vars. Install with `uv sync --extra snowflake`.
+- **Snapshots:** every pull is saved once under a content-hash id (`SNAP_<16 hex>`). The hash is verified on every load, and the id is recorded in each market's meta, so every experiment names the exact data it ran on. `--snapshot SNAP_...` re-prepares one without pulling; `--list-snapshots` lists them.
+- **Data-quality gate:** checks for duplicate keys, incomplete or non-positive rows, stale (carried-forward) days, gaps, weekend dates and bad-tick jumps. Duplicates and too few complete curves stop the run unless you pass `--allow-dq-fail`.
+- **Feature store** (`[features] source = "snowflake"`): mapped features use store values on clean days. Unmapped features and the PCA factors stay computed, because PCA must be fitted inside the fold. Injected days get the store value plus the computed effect of the perturbation, so the evaluation stays consistent. A parity report (corr and std ratio, computed vs store) is printed and saved per market.
+- **Tests:** `python tests/test_data_sources.py` runs against a fake Snowflake connector, so no account is needed.
+
 ## Quick start
 
 ```bash
 uv sync
-uv run prepare.py                          # synthetic curves for the 7 markets (~15 s)
+uv run prepare.py                          # synthetic curves, active markets from fera.toml
+# or: uv sync --extra snowflake && uv run prepare.py --source snowflake
 # or: uv run prepare.py --curves curves.parquet   (TRADE_DATE, MARKET, MONTH_OFFSET, VALUE_NATIVE)
 uv run train.py                            # one experiment (~2 min, GPU if available else CPU)
 ```
@@ -58,6 +70,9 @@ Have a look at program.md and let's kick off a new experiment! Let's do the setu
 ## Project structure
 
 ```
+fera.toml       — data-source config: markets, Snowflake view/columns, entity map, feature store (no secrets)
+data_sources.py — Snowflake pulls, content-hashed snapshots, data-quality checks (do not modify)
+tests/          — data-layer tests (fake Snowflake connector)
 prepare.py      — data prep, features, splits, scalers, injection, fixed metric, outputs (do not modify)
 train.py        — Shape AE model, loss, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
@@ -87,6 +102,17 @@ The repo is deliberately kept small and only really has three files that matter:
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+
+## Data (step 1: Snowflake source, snapshots, data quality)
+
+`fera.toml` holds the data-source config: active markets (GAS first, so `TTF`, `THE`), the curve view and its columns, the ENTITY_ID → market map, and the optional feature-store mapping. It contains no secrets.
+
+- **Sources:** `--source snowflake` pulls the long view; `--curves file` reads a parquet/CSV export; the default is synthetic curves. Basis-reference markets are pulled automatically.
+- **Auth, tried in order:** the SPCS session token, then `connection_name` in `~/.snowflake/connections.toml`, then `SNOWFLAKE_*` env vars. Install with `uv sync --extra snowflake`.
+- **Snapshots:** every pull is saved once under a content-hash id (`SNAP_<16 hex>`). The hash is verified on every load, and the id is recorded in each market's meta, so every experiment names the exact data it ran on. `--snapshot SNAP_...` re-prepares one without pulling; `--list-snapshots` lists them.
+- **Data-quality gate:** checks for duplicate keys, incomplete or non-positive rows, stale (carried-forward) days, gaps, weekend dates and bad-tick jumps. Duplicates and too few complete curves stop the run unless you pass `--allow-dq-fail`.
+- **Feature store** (`[features] source = "snowflake"`): mapped features use store values on clean days. Unmapped features and the PCA factors stay computed, because PCA must be fitted inside the fold. Injected days get the store value plus the computed effect of the perturbation, so the evaluation stays consistent. A parity report (corr and std ratio, computed vs store) is printed and saved per market.
+- **Tests:** `python tests/test_data_sources.py` runs against a fake Snowflake connector, so no account is needed.
 
 ## Quick start
 

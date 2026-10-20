@@ -14,7 +14,7 @@ To set up a new experiment, work with the user to:
    - `README.md`: repository context.
    - `prepare.py`: fixed constants, data prep, features, splits, scalers, anomaly injection, evaluation and output export. Do not modify.
    - `train.py`: the file you modify. Model architecture, inputs used, loss, optimizer, training loop.
-4. **Verify data exists**: check that `~/.cache/autoresearch/shape_ae/markets/` contains `meta.json` and one `.npz` per market. If not, tell the human to run `uv run prepare.py` (synthetic curves) or `uv run prepare.py --curves <file>` (real curves).
+4. **Verify data exists**: check that `~/.cache/autoresearch/shape_ae/markets/` contains `meta.json` and one `.npz` per market. If not, tell the human to run `uv run prepare.py --source snowflake` (real curves), `uv run prepare.py --curves <file>`, or `uv run prepare.py` (synthetic). Note the `snapshot_id` in `meta.json`. All runs in one session must use the same snapshot, otherwise their scores are not comparable. `fera.toml`, `data_sources.py` and `tests/` are fixed like `prepare.py`.
 5. **Initialize results.tsv**: create `results.tsv` with just the header row. The baseline is recorded after the first run.
 6. **Confirm and go**: confirm the setup looks good.
 

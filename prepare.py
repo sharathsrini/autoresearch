@@ -85,10 +85,9 @@ MARKETS = {
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", "shape_ae")
+CACHE_DIR = os.environ.get("SHAPE_AE_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", "shape_ae"))
 DATA_DIR = os.path.join(CACHE_DIR, "markets")
 OUTPUT_DIR = os.path.join(CACHE_DIR, "outputs")
-RAW_CURVES = os.path.join(CACHE_DIR, "curves_long.csv.gz")
 
 # ---------------------------------------------------------------------------
 # Price transform
@@ -311,7 +310,7 @@ def _inject(T, kind, j_rng, sigma, months_row):
         t[12:] += a * sbar * ((k[12:] - 12) / 23.0) ** 2 * 2.0
     return t
 
-def process_market(mkt, wide, ref_wide, cfg):
+def process_market(mkt, wide, ref_wide, cfg, store=None):
     kind = cfg["transform"]
     P = wide.to_numpy(dtype=np.float64)
     ok = np.isfinite(P).all(1)
@@ -330,6 +329,19 @@ def process_market(mkt, wide, ref_wide, cfg):
 
     raw = raw_features(T, dates, T_ref)
     n = len(T)
+
+    # Feature store: clean-day values replace the computed ones for the mapped scalar features.
+    # Injected days later get store value + (perturbed computed - clean computed).
+    scalar_computed = raw["scalar"].copy()
+    store_cols, parity = [], None
+    if store is not None:
+        from data_sources import feature_parity
+        S = store.reindex(dates)
+        store_cols = [c for c in FEATURES[:-N_PCA] if c in S.columns]
+        comp = pd.DataFrame(scalar_computed, index=dates, columns=FEATURES[:-N_PCA])
+        parity = feature_parity(comp, S[store_cols])
+        for c in store_cols:
+            raw["scalar"][:, FEATURES.index(c)] = S[c].to_numpy(dtype=np.float64)
 
     # Splits
     is_fit = dates <= TRAIN_END
@@ -398,7 +410,8 @@ def process_market(mkt, wide, ref_wide, cfg):
             Ts = T[lo:r + 1].copy()
             Ts[-1] = _inject(Ts[-1], akind, rng, sigma, months_all[r])
             rs = raw_features(Ts, dates[lo:r + 1], None if T_ref is None else T_ref[lo:r + 1])
-            f = assemble(rs["scalar"][-1:], rs["shape"][-1:], rs["dshape"][-1:])
+            store_offset = raw["scalar"][r] - scalar_computed[r]  # 0 for computed features
+            f = assemble(rs["scalar"][-1:] + store_offset, rs["shape"][-1:], rs["dshape"][-1:])
             inj["curve"].append(scale("curve", Ts[-1:])[0])
             inj["shape"].append(scale("shape", rs["shape"][-1:])[0])
             inj["dshape"].append(scale("dshape", np.nan_to_num(rs["dshape"][-1:]))[0])
@@ -421,31 +434,108 @@ def process_market(mkt, wide, ref_wide, cfg):
     meta = dict(market=mkt, **cfg, n_rows=n, n_fit=len(fit_idx), n_early_stop=len(es_idx),
                 n_calibration=len(cal_idx), n_test=len(test_idx), n_injected=len(inj["row"]),
                 calm_fallback=bool(calm_fallback), first_date=str(dates[0].date()),
-                last_date=str(dates[-1].date()))
+                last_date=str(dates[-1].date()), store_features=store_cols, feature_parity=parity)
     return arrays, meta
 
-def prepare(curves_path=None, seed=0):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if curves_path is None:
-        print("No --curves given: generating synthetic curves for the 7 FERA markets")
-        synthesize_curves(seed).to_csv(RAW_CURVES, index=False)
-        curves_path = RAW_CURVES
-    wides = read_curves(curves_path)
+def _wides_from_long(df):
+    out = {}
+    for mkt, g in df.groupby("MARKET"):
+        w = g.pivot_table(index="TRADE_DATE", columns="MONTH_OFFSET", values="VALUE_NATIVE", aggfunc="last")
+        out[mkt] = w.reindex(columns=range(1, N_TENORS + 1)).sort_index()
+    return out
+
+def _long_from_file(path):
+    rows = []
+    for mkt, w in read_curves(path).items():
+        d = w.stack().rename("VALUE_NATIVE").reset_index()
+        d.columns = ["TRADE_DATE", "MONTH_OFFSET", "VALUE_NATIVE"]
+        d["MARKET"] = mkt
+        rows.append(d)
+    return pd.concat(rows, ignore_index=True)
+
+def acquire(source, curves_path=None, snapshot=None, seed=0, markets=None):
+    """Get curves (+ store features) from a source, snapshot them, return the snapshot id."""
+    import data_sources as ds
+    cfg = ds.load_config()
+    if markets:
+        cfg["active_markets"] = list(markets)
+    if snapshot:
+        return snapshot, cfg
+    feats = None
+    if source == "synthetic":
+        curves, origin = synthesize_curves(seed), f"synthetic(seed={seed})"
+    elif source == "file":
+        curves, origin = _long_from_file(curves_path), f"file:{os.path.abspath(curves_path)}"
+    elif source == "snowflake":
+        pull = ds.markets_to_pull(cfg, MARKETS)
+        print(f"Pulling {pull} from Snowflake {cfg['snowflake']['curves']['table']} ...")
+        conn = ds.connect(cfg)
+        try:
+            curves = ds.pull_curves(conn, cfg, pull)
+            if cfg["features"]["source"] == "snowflake":
+                feats = ds.pull_features(conn, cfg, cfg["active_markets"])
+        finally:
+            conn.close()
+        origin = f"snowflake:{cfg['snowflake']['curves']['table']}"
+    else:
+        raise ValueError(source)
+    snap = ds.save_snapshot(curves, feats, source=origin,
+                            extra=dict(config_curves=cfg["snowflake"]["curves"] if source == "snowflake" else None))
+    return snap, cfg
+
+def prepare(source="synthetic", curves_path=None, snapshot=None, seed=0, markets=None, allow_dq_fail=False):
+    import shutil
+    import data_sources as ds
+    snap, cfg = acquire(source, curves_path, snapshot, seed, markets)
+    curves, feats, manifest = ds.load_snapshot(snap)
+    print(f"Snapshot {snap}  ({manifest['source']}, created {manifest['created_utc']})")
+    wides = _wides_from_long(curves)
+    active = [m for m in cfg["active_markets"] if m in wides]
+    missing = [m for m in cfg["active_markets"] if m not in wides]
+    if missing:
+        print(f"WARNING: active markets not in snapshot: {missing}")
+    if not active:
+        raise SystemExit("No active market has data. Check active_markets in fera.toml / --markets.")
+
+    report = ds.check_curves(curves[curves["MARKET"].isin(wides)],
+                             {m: market_config(m, w)["transform"] for m, w in wides.items()})
+    ds.print_dq(report)
+    fatal = {m: r["fatal"] for m, r in report.items() if r["fatal"] and m in active}
+    if fatal and not allow_dq_fail:
+        raise SystemExit(f"Data-quality check failed for {list(fatal)} (use --allow-dq-fail to override)")
+
+    if os.path.isdir(DATA_DIR):
+        shutil.rmtree(DATA_DIR)  # never mix markets from different snapshots
+    os.makedirs(DATA_DIR)
+    store_by_mkt = {}
+    if feats is not None:
+        for m, g in feats.groupby("MARKET"):
+            store_by_mkt[m] = g.drop(columns="MARKET").set_index("TRADE_DATE").sort_index()
     metas = {}
-    for mkt, wide in wides.items():
-        cfg = market_config(mkt, wide)
-        ref = cfg.get("basis_ref")
+    for mkt in active:
+        wide = wides[mkt]
+        mcfg = market_config(mkt, wide)
+        ref = mcfg.get("basis_ref")
         if ref is not None and ref not in wides:
-            cfg["basis_ref"] = ref = None
-        out = process_market(mkt, wide, wides[ref] if ref else None, cfg)
+            print(f"  {mkt}: basis reference {ref} not in snapshot, basis features set to 0")
+            mcfg["basis_ref"] = ref = None
+        out = process_market(mkt, wide, wides[ref] if ref else None, mcfg, store_by_mkt.get(mkt))
         if out is None:
             continue
         arrays, meta = out
+        meta.update(snapshot_id=snap, data_quality=report.get(mkt))
         np.savez_compressed(os.path.join(DATA_DIR, f"{mkt}.npz"), **arrays)
         metas[mkt] = meta
-        print(f"  {mkt:12s} {cfg['transform']:5s} rows={meta['n_rows']:5d} fit={meta['n_fit']:5d} "
+        print(f"  {mkt:12s} {mcfg['transform']:5s} rows={meta['n_rows']:5d} fit={meta['n_fit']:5d} "
               f"es={meta['n_early_stop']:4d} cal={meta['n_calibration']:4d} test={meta['n_test']:4d} "
-              f"injected={meta['n_injected']:4d}{' (calm fallback)' if meta['calm_fallback'] else ''}")
+              f"injected={meta['n_injected']:4d}{' (calm fallback)' if meta['calm_fallback'] else ''}"
+              f"{' store=' + ','.join(meta['store_features']) if meta['store_features'] else ''}")
+        if meta["feature_parity"]:
+            for c, v in meta["feature_parity"].items():
+                print(f"  {'':12s} parity {c:16s} n={v['n']:5d} corr={v.get('corr', float('nan')):.3f} "
+                      f"std_ratio={v.get('std_ratio', float('nan')):.3f}")
+    if not metas:
+        raise SystemExit("No market could be prepared.")
     with open(os.path.join(DATA_DIR, "meta.json"), "w") as f:
         json.dump(metas, f, indent=2)
 
@@ -687,10 +777,22 @@ def _plot_day(market, date, p_true, p_hat, res, fres, row, path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare forward-curve data for Shape AE autoresearch")
-    parser.add_argument("--curves", type=str, default=None,
-                        help="Path to curves (.parquet/.csv, long or wide). Omit for synthetic data.")
+    parser.add_argument("--source", choices=["synthetic", "file", "snowflake"], default=None,
+                        help="Where curves come from (default: file if --curves else synthetic)")
+    parser.add_argument("--curves", type=str, default=None, help="Curves file (.parquet/.csv, long or wide)")
+    parser.add_argument("--snapshot", type=str, default=None, help="Re-prepare an existing snapshot id")
+    parser.add_argument("--markets", type=str, default=None,
+                        help="Comma-separated markets to prepare (default: active_markets in fera.toml)")
     parser.add_argument("--seed", type=int, default=0, help="Seed for synthetic curves")
+    parser.add_argument("--allow-dq-fail", action="store_true", help="Prepare despite fatal data-quality findings")
+    parser.add_argument("--list-snapshots", action="store_true")
     args = parser.parse_args()
+    if args.list_snapshots:
+        import data_sources as ds
+        print("\n".join(ds.list_snapshots()) or "(none)")
+        raise SystemExit(0)
+    source = args.source or ("file" if args.curves else "synthetic")
     print(f"Cache directory: {CACHE_DIR}")
-    prepare(args.curves, args.seed)
+    prepare(source, args.curves, args.snapshot, args.seed,
+            args.markets.split(",") if args.markets else None, args.allow_dq_fail)
     print("Done! Ready to train.")
